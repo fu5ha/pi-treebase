@@ -1,0 +1,23 @@
+{
+    "name": "pi-treebase",
+    "version": "0.1.0",
+    "description": "Interactive-rebase style tree navigation for pi sessions.",
+    "type": "module",
+    "keywords": [
+        "pi-package"
+    ],
+    "pi": {
+        "extensions": [
+            "./extensions"
+        ]
+    },
+    "peerDependencies": {
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+        "typebox": "*"
+    },
+    "devDependencies": {
+        "typescript": "^5.0.0"
+    }
+}
