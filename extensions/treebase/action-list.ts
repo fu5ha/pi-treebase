@@ -175,9 +175,113 @@ class ActionList {
         return "│  ";
     }
 
+    private baseGroupId(groupId: string): string {
+        return groupId.replace(/:(tools|final)$/, "");
+    }
+
+    private isAssistantGroupedEntry(entry: SessionEntry): boolean {
+        return (
+            entry.type === "message" &&
+            (entry.message?.role === "assistant" ||
+                entry.message?.role === "toolResult")
+        );
+    }
+
     private setCurrent(action: TreebaseAction) {
-        const groupId = this.visibleItems()[this.selected]?.groupId;
-        if (groupId) this.items = setGroupAction(this.items, groupId, action);
+        const selectedItem = this.visibleItems()[this.selected];
+        if (!selectedItem) return;
+
+        if (this.isAssistantGroupedEntry(selectedItem.entry)) {
+            this.setAssistantGroupAction(selectedItem, action);
+            return;
+        }
+
+        this.items = setGroupAction(this.items, selectedItem.groupId, action);
+    }
+
+    private setAssistantGroupAction(
+        selectedItem: ActionItem,
+        action: TreebaseAction,
+    ) {
+        const base = this.baseGroupId(selectedItem.groupId);
+        const assistantItems = this.items.filter(
+            (item) =>
+                this.baseGroupId(item.groupId) === base &&
+                this.isAssistantGroupedEntry(item.entry),
+        );
+        const visibleAssistantItems = assistantItems.filter(
+            (item) => !this.isHiddenToolCallEnvelope(item.entry),
+        );
+
+        // If there is no distinct final assistant response visible, keep the
+        // original whole-group behavior.
+        if (visibleAssistantItems.length < 2) {
+            this.items = setGroupAction(this.items, selectedItem.groupId, action);
+            return;
+        }
+
+        const finalItem = visibleAssistantItems[visibleAssistantItems.length - 1];
+        const selectedIsFinal = selectedItem.id === finalItem.id;
+        const toolsGroupId = `${base}:tools`;
+        const finalGroupId = `${base}:final`;
+
+        const isAlreadySplit = assistantItems.some(
+            (item) => item.groupId === toolsGroupId || item.groupId === finalGroupId,
+        );
+        const finalAction = finalItem.action;
+
+        if (!selectedIsFinal) {
+            // User changed a tool result / intermediate assistant row. Split the
+            // turn into an intermediate tools group plus the final response. The
+            // final response keeps its existing mode. If the requested action
+            // matches the final response, rejoin instead.
+            if (action === finalAction) {
+                this.items = this.items.map((item) => {
+                    if (this.baseGroupId(item.groupId) !== base) return item;
+                    if (!this.isAssistantGroupedEntry(item.entry)) return item;
+                    return { ...item, groupId: base, action };
+                });
+                return;
+            }
+
+            this.items = this.items.map((item) => {
+                if (this.baseGroupId(item.groupId) !== base) return item;
+                if (!this.isAssistantGroupedEntry(item.entry)) return item;
+                if (item.id === finalItem.id) {
+                    return { ...item, groupId: finalGroupId };
+                }
+                return { ...item, groupId: toolsGroupId, action };
+            });
+            return;
+        }
+
+        if (!isAlreadySplit) {
+            // User changed the final response while the assistant turn is still
+            // unified. update the whole group.
+            this.items = setGroupAction(this.items, selectedItem.groupId, action);
+            return;
+        }
+
+        // User changed the final response in an already split assistant turn.
+        // If it now matches the tools/intermediate group, rejoin the turn.
+        const toolsAction = this.items.find(
+            (item) => item.groupId === toolsGroupId,
+        )?.action;
+
+        if (toolsAction && toolsAction === action) {
+            this.items = this.items.map((item) => {
+                if (this.baseGroupId(item.groupId) !== base) return item;
+                if (!this.isAssistantGroupedEntry(item.entry)) return item;
+                return { ...item, groupId: base, action };
+            });
+            return;
+        }
+
+        this.items = this.items.map((item) =>
+            item.id === finalItem.id
+                ? { ...item, groupId: finalGroupId, action }
+                : item,
+        );
     }
 
     private jumpGroup(direction: "up" | "down") {
