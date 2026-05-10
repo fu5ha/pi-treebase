@@ -8,7 +8,7 @@ with something similar to `git rebase --interactive`.
 ## Installation
 
 ```bash
-pi install git:github.com/fu5ha/pi-treebase
+pi install npm:@grayolson/pi-treebase
 ```
 
 ## Usage

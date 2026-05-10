@@ -10,8 +10,7 @@
         "LICENSE"
     ],
     "scripts": {
-        "typecheck": "tsc --noEmit",
-        "pack:dry-run": "npm pack --dry-run"
+        "typecheck": "tsc --noEmit"
     },
     "keywords": [
         "pi-package"
@@ -19,7 +18,8 @@
     "pi": {
         "extensions": [
             "./extensions"
-        ]
+        ],
+        "image": "https://github.com/fu5ha/pi-treebase/raw/main/content/demo.gif"
     },
     "peerDependencies": {
         "@earendil-works/pi-ai": "*",
