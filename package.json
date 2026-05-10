@@ -1,8 +1,18 @@
 {
-    "name": "pi-treebase",
+    "name": "@grayolson/pi-treebase",
     "version": "0.1.0",
     "description": "Interactive-rebase style tree navigation for pi sessions.",
     "type": "module",
+    "license": "MIT",
+    "files": [
+        "extensions",
+        "README.md",
+        "LICENSE"
+    ],
+    "scripts": {
+        "typecheck": "tsc --noEmit",
+        "pack:dry-run": "npm pack --dry-run"
+    },
     "keywords": [
         "pi-package"
     ],

@@ -222,7 +222,7 @@ export default function (pi: ExtensionAPI) {
             );
             const actionItems = makeActionItems(segment);
             if (segment.length === 0 || actionItems.length === 0) {
-                ctx.ui.notify("Could not compute treebase path with context-bearing entries", "error");
+                ctx.ui.notify("Could not compute treebase path with any context-bearing entries", "error");
                 return;
             }
 
