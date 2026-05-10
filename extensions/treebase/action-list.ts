@@ -14,7 +14,7 @@ import {
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildSummarizerUserMessage } from "./summarize.js";
+import { buildSummarizerContext } from "./summarize.js";
 import { actionLetter, type ActionItem, type TreebaseAction } from "./tree-utils.js";
 
 type Theme = any;
@@ -309,6 +309,7 @@ function toActionItems(model: ActionModel): ActionItem[] {
         const groupId = row.groupId ?? row.source.groupId;
         return {
             ...row.source,
+            index: row.index,
             action: model.groups.get(groupId)?.action ?? row.source.action,
             groupId,
         };
@@ -483,7 +484,7 @@ class ActionList {
     }
 
     private writeSummarizerMessageAndCancel(): void {
-        const message = buildSummarizerUserMessage(toActionItems(this.model));
+        const message = buildSummarizerContext(toActionItems(this.model)).message;
         const tmpFile = path.join(os.tmpdir(), `pi-treebase-summarizer-message-${Date.now()}.xml`);
         fs.writeFileSync(tmpFile, message || "<!-- No summarize-high/summarize-low groups selected. -->\n", "utf-8");
         this.ctx.ui.notify(`Treebase summarizer message written to: ${tmpFile}`, "info");

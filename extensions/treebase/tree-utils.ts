@@ -18,6 +18,7 @@ export type TreebaseAction =
     | "drop";
 
 export type ActionItem = {
+    index: number;
     id: string;
     entry: SessionEntry;
     action: TreebaseAction;
@@ -102,7 +103,7 @@ export function makeActionItems(entries: SessionEntry[]): ActionItem[] {
     let turn = 0;
     let assistantGroupId: string | null = null;
 
-    return actionableEntries.map((entry) => {
+    return actionableEntries.map((entry, index) => {
         const role =
             entry.type === "message" ? entry.message?.role : entry.type;
         let groupId: string;
@@ -127,7 +128,7 @@ export function makeActionItems(entries: SessionEntry[]): ActionItem[] {
             groupId = `turn-${turn}-${entry.type}-${entry.id}`;
         }
 
-        return { id: entry.id, entry, action: "summarize-low", groupId, depth: 0 };
+        return { index, id: entry.id, entry, action: "summarize-low", groupId, depth: 0 };
     });
 }
 

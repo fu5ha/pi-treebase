@@ -1,6 +1,10 @@
-import { complete, type UserMessage } from "@earendil-works/pi-ai";
+import { complete, ToolCall, ToolResultMessage, type UserMessage } from "@earendil-works/pi-ai";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
     BorderedLoader,
+    SessionMessageEntry,
     type ExtensionCommandContext,
     type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
@@ -9,31 +13,64 @@ import { type ActionItem } from "./tree-utils.js";
 export type RewritePart =
     | { kind: "pick"; item: ActionItem }
     | {
+          kind: "retained-tool-use";
+          toolCallItem: ActionItem;
+          toolResultItem: ActionItem;
+          toolCallId: string;
+      }
+    | {
           kind: "summary";
-          priority: "combined";
           text: string;
           sourceIds: string[];
           readFiles: string[];
           modifiedFiles: string[];
       };
 
+export type ToolRetentionCandidate = {
+    /** Short model-facing id used in <tool-use-retention-candidate id="...">. */
+    shortId: string;
+    /** Actual tool call id from the assistant toolCall block and toolResult.toolCallId. */
+    toolCallId: string;
+    toolCallItemIndex: number;
+    toolResultItemIndex: number;
+    toolName: string;
+    preview: string;
+};
+
+export type BuildSummarizerContextResult = {
+    message: string;
+    toolRetentionCandidates: ToolRetentionCandidate[];
+};
+
+export type TreebaseDebugFiles = {
+    summarizerMessagePath?: string;
+    summarizerResponsePath?: string;
+};
+
+export type BuildRewriteResult = {
+    parts: RewritePart[];
+    debugFiles: TreebaseDebugFiles;
+};
+
 const SYSTEM_PROMPT = `You summarize conversation history segments between a user and an expert coding agent inside the pi coding agent harness.
 
-Input contains <summary-group> elements. Each <summary-group> should become exactly one combined summary.
+Input is a marked-up conversation segment.
 
-Inside each summary group, prepared conversation content is wrapped in <importance level="high"> or <importance level="low"> tags.
+Input contains <summary-group> elements. Each <summary-group> should become exactly one combined summary in the output.
 
-Input may also contain top level <picked-verbatim-group> elements between summary groups. Conversation inside those tags will be kept verbatim and interspersed in order with the summaries you produce. Use that picked-verbatim context to make each summary coherent in its final surrounding context, but do not summarize or repeat picked-verbatim content unless needed as a brief reference.
+Inside each summary group, conversation content is wrapped in <importance level="high"> or <importance level="low"> tags which represent input from
+the user about how important that part of the conversation should be weighted in the summarization. High-importance input should be preserved in detail and be mentioned prominently in output. Low-importance input should be summarized briefly. Combine high and low importance inputs into one coherent summary per group.
+
+Some high-importance agent tool calls and their matching tool results may be wrapped in <tool-use-retention-candidate id="..."> blocks. The user marked these for you to consider for verbatim retention. Keep candidates when the full tool call content still seems useful after the summarizatoin history, such as important file contents, useful searches, diagnostics, etc. that continued work will still use. Add each tool use you think should be retained to the "keep_tool_use_ids" arrays in the output.
+
+Input may also contain top level <picked-verbatim-group> elements between summary groups. Conversation inside those tags was selected by the user to be kept verbatim and will be interspersed in order with the summaries you produce. Use that picked-verbatim context to make each summary coherent in its final surrounding context, but do not summarize or repeat picked-verbatim content unless needed as a brief reference.
 
 Return ONLY JSON with this shape:
-{"summary_groups":[{"id":"g1","summary":"..."}]}
+{"summary_groups":[{"id":"g1","summary":"..."}],"keep_tool_use_ids":["tu-1-xxxx"]}
 
-Keep summary group order and ids exactly as given.
+Keep summary group order and ids exactly as given. Always include keep_tool_use_ids, using [] when no candidates should be retained.
 
-High-importance input should be preserved in detail and be mentioned prominently in output. Low-importance input should be summarized briefly: enough to preserve chronology, but not details.
-Combine high and low importance inputs into one coherent summary per group.
-Make summaries fit naturally before/after the picked-verbatim groups that surround them.
-Do not invent facts.
+Keep each section concise and simple while still retaining important information. Preserve exact file paths, function names, and error messages.
 
 Use the following format as guide for each summary:
 
@@ -54,10 +91,9 @@ Use the following format as guide for each summary:
 ### Blocked
 - [Issues preventing progress, if any, omit section if none]
 
-## Key Decisions
+## Key Decisions [only include if there was at least one high importance block in this summary group]
 - **[Decision]**: [Brief rationale]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+`;
 
 type AgentMessage = any;
 type FileOps = { read: Set<string>; written: Set<string>; edited: Set<string> };
@@ -224,7 +260,10 @@ function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOps) {
     }
 }
 
-/** Copied from pi's prepareBranchEntries algorithm, adapted for treebase. */
+// Copied from pi's prepareBranchEntries
+// TODO(slop-cleanup): this is used very wrong, it should be used once, after action list entries that were
+// dropped have been culled and we've determined tool use retention candidates.
+// probably it should take actionItems instead of session entries and token budget should actually be used properly
 export function prepareBranchEntries(
     entries: SessionEntry[],
     tokenBudget = 0,
@@ -391,11 +430,11 @@ function formatFileOperations(fileOps: FileOps): string {
     return sections.length ? `\n${sections.join("\n\n")}` : "";
 }
 
-function groupSummaries(items: ActionItem[]) {
+function groupSummaries(items: ActionItem[], excludedIds = new Set<string>()) {
     const groups: Array<{ id: string; items: ActionItem[] }> = [];
     let current: (typeof groups)[number] | null = null;
     for (const item of items) {
-        if (item.action === "pick") {
+        if (item.action === "pick" || excludedIds.has(item.id)) {
             current = null;
             continue;
         }
@@ -425,11 +464,151 @@ function splitByImportance(
     return out;
 }
 
-export function buildSummarizerUserMessage(items: ActionItem[]): string {
-    const groups = groupSummaries(items);
+function textFromToolResult(message: AgentMessage | undefined): string {
+    const content = message?.content;
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content
+        .map((block: any) => {
+            if (block?.type === "text") return block.text ?? "";
+            if (block?.type === "image") return `[image: ${block.mimeType ?? "unknown"}]`;
+            return JSON.stringify(block);
+        })
+        .filter(Boolean)
+        .join("\n");
+}
+
+function formatToolCall(block: any): string {
+    return `${block.name}(${Object.entries(block.arguments ?? {})
+        .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+        .join(", ")})`;
+}
+
+function findToolCallBlock(item: ActionItem, toolCallId: string): ToolCall | undefined {
+    if (item.entry.type !== "message") return undefined;
+    const msg = item.entry.message;
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) return undefined;
+    return msg.content.find(
+        (block) => block.type === "toolCall" && block.id === toolCallId,
+    ) as ToolCall;
+}
+
+function serializeToolRetentionCandidate(
+    candidate: ToolRetentionCandidate,
+    items: ActionItem[],
+): string {
+    const toolCallItem = items[candidate.toolCallItemIndex];
+    const toolResultItem = items[candidate.toolResultItemIndex];
+    const call = toolCallItem
+        ? findToolCallBlock(toolCallItem, candidate.toolCallId)
+        : undefined;
+    const result = (toolResultItem?.entry as any)?.message;
+    const resultText = textFromToolResult(result);
+    const error = result?.isError ? ` isError="true"` : "";
+    return `<tool-use-retention-candidate id="${candidate.shortId}">\n<tool-call>\n${call ? formatToolCall(call) : candidate.toolName}\n</tool-call>\n<tool-result toolName="${candidate.toolName}"${error}>\n${resultText}\n</tool-result>\n</tool-use-retention-candidate>`;
+}
+
+function findHighToolRetentionCandidates(items: ActionItem[]): ToolRetentionCandidate[] {
+    const candidates: ToolRetentionCandidate[] = [];
+    const seen = new Set<string>();
+    for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+        const item = items[itemIndex];
+        if (item.action !== "summarize-high" || item.entry.type !== "message")
+            continue;
+        const msg = item.entry.message;
+        if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+        for (const block of msg.content) {
+            if (block?.type !== "toolCall" || typeof block.id !== "string") continue;
+            if (seen.has(block.id)) continue;
+            const relativeToolResultItemIndex = items.slice(itemIndex + 1).findIndex(candidate => {
+                if (
+                    candidate.entry.type !== "message"
+                )
+                    return false;
+                const resultMsg = candidate.entry.message;
+                return (
+                    resultMsg.role === "toolResult" &&
+                    resultMsg.toolCallId === block.id
+                );
+            });
+            if (relativeToolResultItemIndex < 0) continue;
+            const toolResultItemIndex = itemIndex + 1 + relativeToolResultItemIndex;
+            seen.add(block.id);
+
+            const toolResultItem = items[toolResultItemIndex];
+            const resultMsg = (toolResultItem.entry as SessionMessageEntry).message as ToolResultMessage;
+            const preview = textFromToolResult(resultMsg).slice(0, 1000);
+            candidates.push({
+                shortId: `tu-${candidates.length + 1}-${block.id.slice(5,9)}`,
+                toolCallId: block.id,
+                toolCallItemIndex: itemIndex,
+                toolResultItemIndex,
+                toolName: block.name ?? resultMsg.toolName ?? "tool",
+                preview,
+            });
+        }
+    }
+    return candidates;
+}
+
+function serializeItemsForSummary(
+    itemsToSerialize: ActionItem[],
+    allItems: ActionItem[],
+    candidatesByAssistantId: Map<string, ToolRetentionCandidate[]>,
+): string {
+    const parts: string[] = [];
+    for (const item of itemsToSerialize) {
+        if (item.entry.type !== "message") {
+            const msg = getMessageFromEntry(item.entry);
+            if (msg) parts.push(serializeConversation(convertToLlm([msg])));
+            continue;
+        }
+        const msg = item.entry.message as any;
+        if (msg.role === "toolResult") continue;
+        const candidates = candidatesByAssistantId.get(item.id) ?? [];
+        if (candidates.length === 0) {
+            const prepared = prepareBranchEntries([item.entry]);
+            const conversation = serializeConversation(convertToLlm(prepared.messages));
+            if (conversation) parts.push(conversation);
+            continue;
+        }
+
+        const candidateIds = new Set(candidates.map((c) => c.toolCallId));
+        const normalMsg = structuredClone(msg);
+        normalMsg.content = (normalMsg.content ?? []).filter(
+            (block: any) => block?.type !== "toolCall" || !candidateIds.has(block.id),
+        );
+        if (hasSubstantiveAssistantContent(normalMsg)) {
+            const conversation = serializeConversation(convertToLlm([normalMsg]));
+            if (conversation) parts.push(conversation);
+        }
+        for (const candidate of candidates)
+            parts.push(serializeToolRetentionCandidate(candidate, allItems));
+    }
+    return parts.join("\n\n");
+}
+
+export function buildSummarizerContext(
+    items: ActionItem[],
+    options?: {
+        /** Entry ids to treat as verbatim context and exclude from summary groups. */
+        verbatimIds?: Set<string>;
+    },
+): BuildSummarizerContextResult {
+    const groups = groupSummaries(items, options?.verbatimIds);
+    const toolRetentionCandidates = findHighToolRetentionCandidates(items);
     const groupIdByItem = new Map<string, string>();
     for (const group of groups)
         for (const item of group.items) groupIdByItem.set(item.id, group.id);
+
+    const candidatesByAssistantId = new Map<string, ToolRetentionCandidate[]>();
+    for (const candidate of toolRetentionCandidates) {
+        const toolCallItem = items[candidate.toolCallItemIndex];
+        if (!toolCallItem) continue;
+        const existing = candidatesByAssistantId.get(toolCallItem.id) ?? [];
+        existing.push(candidate);
+        candidatesByAssistantId.set(toolCallItem.id, existing);
+    }
 
     const parts: string[] = [];
     const emittedSummaryGroups = new Set<string>();
@@ -452,7 +631,7 @@ export function buildSummarizerUserMessage(items: ActionItem[]): string {
 
     for (const item of items) {
         if (item.action === "drop") continue;
-        if (item.action === "pick") {
+        if (item.action === "pick" || options?.verbatimIds?.has(item.id)) {
             pendingPicked.push(item);
             continue;
         }
@@ -467,11 +646,13 @@ export function buildSummarizerUserMessage(items: ActionItem[]): string {
                 const prepared = prepareBranchEntries(
                     section.items.map((sectionItem) => sectionItem.entry),
                 );
-                const conversation = serializeConversation(
-                    convertToLlm(prepared.messages),
+                const conversation = serializeItemsForSummary(
+                    section.items,
+                    items,
+                    candidatesByAssistantId,
                 );
                 const files = formatFileOperations(prepared.fileOps);
-                return `<importance level="${section.level}" entryIds="${section.items.map((sectionItem) => sectionItem.id).join(",")}">\n<conversation>\n${conversation}\n</conversation>${files}\n</importance>`;
+                return `<importance level="${section.level}">\n<conversation>\n${conversation}\n</conversation>${files}\n</importance>`;
             })
             .join("\n---\n");
         parts.push(
@@ -480,19 +661,31 @@ export function buildSummarizerUserMessage(items: ActionItem[]): string {
     }
 
     flushPicked();
-    return parts.join("\n\n");
+    return { message: parts.join("\n\n"), toolRetentionCandidates };
 }
 
 export async function buildRewrite(
     ctx: ExtensionCommandContext,
     items: ActionItem[],
-): Promise<RewritePart[] | null> {
+): Promise<BuildRewriteResult | null> {
     const groups = groupSummaries(items);
+    const summarizerContext = buildSummarizerContext(items);
+    const { toolRetentionCandidates } = summarizerContext;
+    const candidateById = new Map(
+        toolRetentionCandidates.map((candidate) => [candidate.shortId, candidate]),
+    );
     const summaries = new Map<string, string>();
+    const keepToolUseIds = new Set<string>();
+    const debugFiles: TreebaseDebugFiles = {};
 
     if (groups.length > 0) {
         if (!ctx.model) throw new Error("No model selected for summarization");
-        const result = await ctx.ui.custom<string | null>(
+        type SummarizerModelResult = {
+            responseText: string;
+            summarizerMessagePath?: string;
+            summarizerResponsePath?: string;
+        };
+        const result = await ctx.ui.custom<SummarizerModelResult | null>(
             (tui: any, theme: any, _kb: any, done: any) => {
                 const loader = new BorderedLoader(
                     tui,
@@ -500,6 +693,13 @@ export async function buildRewrite(
                     `Treebase summarizing with ${ctx.model.id}...`,
                 );
                 loader.onAbort = () => done(null);
+                const stamp = Date.now();
+                const body = summarizerContext.message;
+                const summarizerMessagePath = path.join(
+                    os.tmpdir(),
+                    `pi-treebase-summarizer-message-${stamp}.xml`,
+                );
+                fs.writeFileSync(summarizerMessagePath, body, "utf-8");
                 const run = async () => {
                     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(
                         ctx.model,
@@ -513,7 +713,6 @@ export async function buildRewrite(
                                           "auth failed",
                                   ),
                         );
-                    const body = buildSummarizerUserMessage(items);
                     const msg: UserMessage = {
                         role: "user",
                         content: [{ type: "text", text: body }],
@@ -529,68 +728,138 @@ export async function buildRewrite(
                         },
                     );
                     if (response.stopReason === "aborted") return null;
-                    return response.content
+                    const responseText = response.content
                         .filter((c: any) => c.type === "text")
                         .map((c: any) => c.text)
                         .join("\n");
+                    const summarizerResponsePath = path.join(
+                        os.tmpdir(),
+                        `pi-treebase-summarizer-response-${stamp}.json`,
+                    );
+                    fs.writeFileSync(summarizerResponsePath, responseText, "utf-8");
+                    return {
+                        responseText,
+                        summarizerMessagePath,
+                        summarizerResponsePath,
+                    };
                 };
                 run()
                     .then(done)
-                    .catch((err) =>
-                        done(
-                            JSON.stringify({
-                                error: String(err?.message ?? err),
-                                groups: [],
-                            }),
-                        ),
-                    );
+                    .catch((err) => {
+                        const responseText = JSON.stringify({
+                            error: String(err?.message ?? err),
+                            groups: [],
+                        });
+                        const summarizerResponsePath = path.join(
+                            os.tmpdir(),
+                            `pi-treebase-summarizer-response-${stamp}.json`,
+                        );
+                        fs.writeFileSync(summarizerResponsePath, responseText, "utf-8");
+                        done({
+                            responseText,
+                            summarizerMessagePath,
+                            summarizerResponsePath,
+                        });
+                    });
                 return loader;
             },
         );
         if (result === null) return null;
+        Object.assign(debugFiles, {
+            summarizerMessagePath: result.summarizerMessagePath,
+            summarizerResponsePath: result.summarizerResponsePath,
+        });
+        const responseText = result.responseText;
         let parsed: any;
         try {
             parsed = JSON.parse(
-                result
+                responseText
                     .replace(/^```json\s*/i, "")
                     .replace(/```$/g, "")
                     .trim(),
             );
         } catch {
             throw new Error(
-                `Could not parse summarizer JSON: ${result.slice(0, 500)}`,
+                `Could not parse summarizer JSON: ${responseText.slice(0, 500)}`,
             );
         }
         if (parsed.error) throw new Error(parsed.error);
         for (const g of parsed.summary_groups ?? [])
             summaries.set(g.id, String(g.summary ?? ""));
+        for (const id of parsed.keep_tool_use_ids ?? []) {
+            if (typeof id === "string" && candidateById.has(id))
+                keepToolUseIds.add(id);
+        }
+    }
+
+    const retainedCandidatesByToolCallItem = new Map<number, ToolRetentionCandidate[]>();
+    const retainedToolResultEntryIds = new Set<string>();
+    for (const id of keepToolUseIds) {
+        const candidate = candidateById.get(id);
+        if (!candidate) continue;
+        const toolResultItem = items[candidate.toolResultItemIndex];
+        if (toolResultItem) retainedToolResultEntryIds.add(toolResultItem.id);
+        const existing = retainedCandidatesByToolCallItem.get(candidate.toolCallItemIndex) ?? [];
+        existing.push(candidate);
+        retainedCandidatesByToolCallItem.set(candidate.toolCallItemIndex, existing);
     }
 
     const groupByItem = new Map<string, string>();
-    for (const g of groups)
+    const groupById = new Map<string, (typeof groups)[number]>();
+    const summaryEmitItemByGroup = new Map<string, string>();
+    for (const g of groups) {
+        groupById.set(g.id, g);
         for (const item of g.items) groupByItem.set(item.id, g.id);
+        const remaining = g.items.filter((item) => !retainedToolResultEntryIds.has(item.id));
+        if (remaining.length === 0) continue;
+        summaryEmitItemByGroup.set(g.id, g.items.at(-1)!.id);
+    }
+
     const emittedGroups = new Set<string>();
     const parts: RewritePart[] = [];
-    for (const item of items) {
+    const emitSummary = (gid: string) => {
+        if (emittedGroups.has(gid)) return;
+        const g = groupById.get(gid);
+        if (!g) return;
+        const summaryItems = g.items.filter((x) => !retainedToolResultEntryIds.has(x.id));
+        if (summaryItems.length === 0) return;
+        emittedGroups.add(gid);
+        const prepared = prepareBranchEntries(summaryItems.map((x) => x.entry));
+        const { readFiles, modifiedFiles } = computeFileLists(prepared.fileOps);
+        parts.push({
+            kind: "summary",
+            text: summaries.get(gid) ?? "",
+            sourceIds: summaryItems.map((x) => x.id),
+            readFiles,
+            modifiedFiles,
+        });
+    };
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
         if (item.action === "drop") continue;
         if (item.action === "pick") {
             parts.push({ kind: "pick", item });
             continue;
         }
+        const retainedCandidates = retainedCandidatesByToolCallItem.get(i) ?? [];
+        for (const candidate of retainedCandidates) {
+            const toolResultItem = items[candidate.toolResultItemIndex];
+            if (!toolResultItem) continue;
+            parts.push({
+                kind: "retained-tool-use",
+                toolCallItem: item,
+                toolResultItem,
+                toolCallId: candidate.toolCallId,
+            });
+        }
+        if (retainedToolResultEntryIds.has(item.id)) {
+            const gid = groupByItem.get(item.id);
+            if (gid && summaryEmitItemByGroup.get(gid) === item.id) emitSummary(gid);
+            continue;
+        }
+
         const gid = groupByItem.get(item.id)!;
-        if (emittedGroups.has(gid)) continue;
-        emittedGroups.add(gid);
-        const g = groups.find((x) => x.id === gid)!;
-        const prepared = prepareBranchEntries(g.items.map((x) => x.entry));
-        const { readFiles, modifiedFiles } = computeFileLists(prepared.fileOps);
-        parts.push({
-            kind: "summary",
-            priority: "combined",
-            text: summaries.get(gid) ?? "",
-            sourceIds: g.items.map((x) => x.id),
-            readFiles,
-            modifiedFiles,
-        });
+        if (summaryEmitItemByGroup.get(gid) === item.id) emitSummary(gid);
     }
-    return parts;
+    return { parts, debugFiles };
 }

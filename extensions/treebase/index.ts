@@ -6,7 +6,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { showActionList } from "./action-list.js";
-import { buildRewrite } from "./summarize.js";
+import { buildRewrite, RewritePart, type BuildRewriteResult } from "./summarize.js";
 import { showTreeSelector } from "./tree-selector.js";
 import {
     entriesBetweenAncestorAndLeaf,
@@ -14,6 +14,7 @@ import {
     makeActionItems,
     parentOf,
 } from "./tree-utils.js";
+import { ToolCall } from "@earendil-works/pi-ai";
 
 function freshId(sm: SessionManager): string {
     for (let i = 0; i < 100; i++) {
@@ -68,6 +69,31 @@ function appendClonedEntry(
     }
 }
 
+function makeRetainedToolUseEntries(part: Extract<RewritePart, { kind: "retained-tool-use" }>): { toolCallEntry: SessionEntry; toolResultEntry: SessionEntry } | null {
+    if (part.toolCallItem.entry.type !== "message") return null;
+    if (part.toolResultItem.entry.type !== "message") return null;
+
+    const toolCallMessage = structuredClone(part.toolCallItem.entry.message);
+    if (toolCallMessage.role !== "assistant" || !Array.isArray(toolCallMessage.content)) return null;
+    const toolCallBlock = toolCallMessage.content.find(
+        (block) => block?.type === "toolCall" && block.id === part.toolCallId,
+    ) as ToolCall | undefined;
+    if (!toolCallBlock) return null;
+
+    const [_callId, itemId] = part.toolCallId.split("|");
+    const newToolCallId = `call_${randomUUID()}|${itemId}`;
+    toolCallMessage.content = [{ ...structuredClone(toolCallBlock), id: newToolCallId }];
+
+    const toolResultMessage = structuredClone(part.toolResultItem.entry.message) as any;
+    if (toolResultMessage.role !== "toolResult") return null;
+    toolResultMessage.toolCallId = newToolCallId;
+
+    return {
+        toolCallEntry: { ...structuredClone(part.toolCallItem.entry), message: toolCallMessage } as SessionEntry,
+        toolResultEntry: { ...structuredClone(part.toolResultItem.entry), message: toolResultMessage } as SessionEntry,
+    };
+}
+
 function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
     const sections: string[] = [];
     if (readFiles.length > 0) {
@@ -109,9 +135,10 @@ function appendSummary(
 async function applyRewrite(
     ctx: ExtensionCommandContext,
     targetId: string,
-    parts: Awaited<ReturnType<typeof buildRewrite>>,
+    rewrite: BuildRewriteResult | null,
 ): Promise<string | null> {
-    if (!parts) return null;
+    if (!rewrite) return null;
+    const { parts } = rewrite;
     // const-cast :flushed: is this bad?
     const sm = ctx.sessionManager as SessionManager;
 
@@ -123,6 +150,12 @@ async function applyRewrite(
     for (const part of parts) {
         if (part.kind === "pick") {
             if (appendClonedEntry(sm, part.item.entry)) appended++;
+        } else if (part.kind === "retained-tool-use") {
+            const entries = makeRetainedToolUseEntries(part);
+            if (entries) {
+                if (appendClonedEntry(sm, entries.toolCallEntry)) appended++;
+                if (appendClonedEntry(sm, entries.toolResultEntry)) appended++;
+            }
         } else if (part.text.trim()) {
             appendSummary(
                 sm,
@@ -239,7 +272,20 @@ export default function (pi: ExtensionAPI) {
                 if (!rewrittenLeafId) return;
 
                 await navigateToRewrittenLeaf(sm, ctx, rewrittenLeafId);
-                ctx.ui.notify("Treebase branch created", "info");
+                const debugPaths = [
+                    rewrite.debugFiles.summarizerMessagePath
+                        ? `summarizer message: ${rewrite.debugFiles.summarizerMessagePath}`
+                        : undefined,
+                    rewrite.debugFiles.summarizerResponsePath
+                        ? `summarizer response: ${rewrite.debugFiles.summarizerResponsePath}`
+                        : undefined,
+                ].filter(Boolean);
+                ctx.ui.notify(
+                    debugPaths.length > 0
+                        ? `Treebase branch created\n${debugPaths.join("\n")}`
+                        : "Treebase branch created",
+                    "info",
+                );
             } catch (err: unknown) {
                 ctx.ui.notify(
                     `Treebase failed: ${err instanceof Error ? err.message : String(err)}`,
