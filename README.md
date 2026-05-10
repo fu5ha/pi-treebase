@@ -3,11 +3,21 @@
 A session history management tool that combines the functionality of the base `/tree` command
 with something similar to `git rebase --interactive`.
 
+![demo gif](./content/demo.gif)
+
+## Installation
+
+```bash
+pi install git:github.com/fu5ha/pi-treebase
+```
+
+## Usage
+
 First, use the `/treebase` and navigate with the normal tree session view to choose the destination
 to rebase history to.
 
-Then, use an interactive editor of flattened history to select what to pick (keep verbatim),
-summarize (with low or high importance), or drop entirely.
+Then, use an interactive editor of flattened history to select what to **`P`ick** (keep verbatim),
+summarize with **`L`ow** or **`H`igh** importance, or **`D`rop** entirely.
 
 A new synthetic history branch is then created from the root you selected, interspersing actual
 picked history entries with generated summaries.
