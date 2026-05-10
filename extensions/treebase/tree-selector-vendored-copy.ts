@@ -10,6 +10,7 @@ import {
     TruncatedText,
     truncateToWidth,
 } from "@earendil-works/pi-tui";
+import { keyHint, keyText } from "./key-hints.js";
 
 let theme: any;
 
@@ -17,14 +18,6 @@ export function setTreeSelectorTheme(injectedTheme: any): void {
     theme = injectedTheme;
 }
 
-function keyText(bindingName: string): string {
-    const short = bindingName.split(".").pop() ?? bindingName;
-    return short.replace(/([A-Z])/g, " $1").toLowerCase();
-}
-
-function keyHint(bindingName: string, label: string): string {
-    return `${keyText(bindingName)}: ${label}`;
-}
 class TreeList {
     flatNodes = [];
     filteredNodes = [];
