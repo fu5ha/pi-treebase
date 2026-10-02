@@ -78,6 +78,34 @@ This is a same-session branch workflow, not a separate session file:
    needed for fully automatic, safe hook-to-activation handoff without a second
    user command. Do not silently substitute a separate session.
 
+## Phase 2 implementation
+
+- `/pi-treebase` and `/treebase` now classify with P/M/X. Unrelated tree
+  destinations are rejected, not navigated to. Locked rows distinguish state,
+  inactive raw history and structural reference targets.
+- The workspace serializes the live manager before editing, including in-memory
+  sessions. Snapshot and manifest hashes are checked on every validation.
+  Extraction uses stable source IDs and explicit M insertion provenance;
+  synthesized custom messages cannot cross ordered P/locked anchors.
+- The same current agent receives a normal user prompt after native temporary
+  branch activation. `ready.json` is an explicit completion request, not
+  authorization to activate. A completed actionable boundary validates it and
+  persists readiness; at most two repair continuations are requested.
+- `agent_settled` only notifies and records an in-memory confirmation. Applying
+  requires `/pi-treebase apply`, idle state, matching working ancestry, settlement
+  confirmation, and fresh validation. After reload, `/pi-treebase resume` must
+  produce a fresh settled run: persisted pre-settlement readiness alone is unsafe.
+- Final reconstruction is preflighted on a detached manager and uses public
+  append APIs plus native navigation. A session-wide committed receipt prevents
+  duplicate application after revisiting the temporary branch. State-only
+  provenance/activation records do not contribute model context.
+- Effective model-context tokens use pi's estimator after native projection and
+  conversion. Acceptance requires no estimated growth and, when known, a fit
+  within 90% of the active model context window. This is not an exact provider
+  token count or semantic proof that X facts cannot recur in new text.
+- H/L grouping, importance prompts, separate summarizer calls and automatic
+  tool-use retention have been removed.
+
 ## Verification
 
 Executed against installed pi 1.0.0:
@@ -92,7 +120,14 @@ Executed against installed pi 1.0.0:
 - `npm audit --omit=dev`: no vulnerabilities. Full development audit reports an
   upstream transitive `brace-expansion` advisory in pi's dependency tree.
 
-Not exercised here: actual terminal P/H/L/D interaction, a live summarizer model
-request, visual cancellation/search/folding, theme switching and terminal resize.
+Phase 2 verification also ran `npm run typecheck` and four focused tests: the
+existing checkpoint/reload regression, aborted/unsettled readiness and duplicate
+commit handling, empty X extraction/outside invariants/P tampering, and locked
+context-edit/compaction effects plus accepted/rejected provenance insertions.
+Lifecycle tests exercise the actual handlers with command/navigation doubles;
+the Phase 1 native navigation smoke remains the integration evidence.
+
+Not exercised here: actual terminal P/M/X interaction, a live current-agent
+editing run, visual cancellation/search/folding, theme switching and terminal resize.
 Those require an interactive pi session and should be checked before release;
 the SDK smoke is not a substitute for that manual acceptance pass.
