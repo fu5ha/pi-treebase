@@ -137,7 +137,14 @@ function makeModel(items: ActionItem[]): ActionModel {
         const groupId = row.groupId ?? `row:${row.index}`;
         row.groupId = groupId;
         const existing = groups.get(groupId);
-        if (existing) existing.rowIndexes.push(row.index);
+        if (existing) {
+            // A group's action belongs to its editable members, not to locked
+            // records that happen to precede them in the same assistant turn.
+            if (row.actionable && !existing.rowIndexes.some((index) => rows[index].actionable)) {
+                existing.action = row.source.action;
+            }
+            existing.rowIndexes.push(row.index);
+        }
         else groups.set(groupId, { id: groupId, rowIndexes: [row.index], action: row.actionable ? row.source.action : "pick" });
     }
 
@@ -196,7 +203,7 @@ function getVisibleRows(model: ActionModel): VisibleActionRow[] {
         .filter((row) => row.visible)
         .map((row) => {
             const groupId = row.groupId ?? `row:${row.index}`;
-            const action = model.groups.get(groupId)?.action ?? "model";
+            const action = row.actionable ? model.groups.get(groupId)?.action ?? "model" : "pick";
             return { rowIndex: row.index, groupId, action, groupPosition: "only" as const };
         });
 
@@ -212,7 +219,7 @@ function getVisibleRows(model: ActionModel): VisibleActionRow[] {
 
 function setGroupAction(model: ActionModel, groupId: GroupId, action: TreebaseAction): void {
     const group = model.groups.get(groupId);
-    if (group && group.rowIndexes.every((index) => model.rows[index].actionable)) group.action = action;
+    if (group && group.rowIndexes.some((index) => model.rows[index].actionable)) group.action = action;
 }
 
 function replaceTurnGroups(model: ActionModel, turn: Turn, groups: ActionGroup[]): void {
@@ -227,7 +234,6 @@ function replaceTurnGroups(model: ActionModel, turn: Turn, groups: ActionGroup[]
 }
 
 function setWholeTurnAction(model: ActionModel, turn: Turn, action: TreebaseAction): void {
-    if (turn.rowIndexes.some((index) => !model.rows[index].actionable)) return;
     replaceTurnGroups(model, turn, [{ id: `turn:${turn.index}:all`, rowIndexes: turn.rowIndexes.slice(), action }]);
 }
 
@@ -237,7 +243,6 @@ function splitAssistantTurn(
     intermediateAction: TreebaseAction,
     finalAction: TreebaseAction,
 ): void {
-    if (turn.rowIndexes.some((index) => !model.rows[index].actionable)) return;
     if (turn.finalRowIndex === undefined) return setWholeTurnAction(model, turn, intermediateAction);
     const intermediateRows = turn.rowIndexes.filter((i) => i !== turn.finalRowIndex);
     if (intermediateRows.length === 0) return setWholeTurnAction(model, turn, finalAction);
@@ -266,7 +271,8 @@ function getAssistantTurnGroups(model: ActionModel, turn: AssistantTurn): Action
 }
 
 function normalizeAssistantTurnGroups(model: ActionModel, turn: AssistantTurn): void {
-    const groups = getAssistantTurnGroups(model, turn);
+    const groups = getAssistantTurnGroups(model, turn)
+        .filter((group) => group.rowIndexes.some((index) => model.rows[index].actionable));
     if (groups.length <= 1) return;
     const firstAction = groups[0].action;
     if (groups.every((group) => group.action === firstAction)) {
@@ -397,6 +403,7 @@ class ActionList {
             const action = this.formatAction(
                 view.action,
                 row.kind === "assistant-intermediate" || row.kind === "tool-result",
+                !row.actionable,
             );
             const prefix = this.formatGroupPrefix(view.groupPosition);
             const content = this.getEntryDisplayText(row.entry, isSelected)
@@ -439,10 +446,12 @@ class ActionList {
     private formatAction(
         action: TreebaseAction,
         subtle: boolean,
+        locked: boolean,
     ): string {
-        const letter = actionLetter(action);
+        const letter = locked ? "L" : actionLetter(action);
         const label = subtle ? `|${letter}|` : `[${letter}]`;
         const styled = (() => {
+            if (locked) return this.theme.fg("dim", label);
             switch (action) {
                 case "pick": return this.theme.fg("warning", label);
                 case "model": return this.theme.fg("accent", label);
@@ -464,7 +473,7 @@ class ActionList {
         if (selected) {
             const row = this.model.rows[selected.rowIndex];
             if (!row.actionable) {
-                this.ctx.ui.notify(`Locked: ${row.source.protectedReason ?? "preserved"}`, "warning");
+                this.ctx.ui.notify(`Locked ${row.source.id}: ${row.source.protectedReason ?? "preserved"}`, "warning");
                 return;
             }
             setRowAction(this.model, selected.rowIndex, action);
@@ -653,7 +662,7 @@ export async function showActionList(
                 const activeTheme = ctx.ui.theme;
                 title.setText(activeTheme.fg("accent", activeTheme.bold("Treebase Actions")));
                 help.setText(activeTheme.fg("muted",
-                    "P - pick, M - model choice (default), X - remove. Locked records preserve raw history / bookkeeping."));
+                    "P - pick, M - model choice (default), X - remove, L - locked. Locked records preserve raw history / bookkeeping."));
                 return container.render(Math.max(3, w)).map(line => truncateToWidth(line, w));
             },
             invalidate: () => container.invalidate(),

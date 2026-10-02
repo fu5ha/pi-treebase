@@ -21,7 +21,9 @@ pi install npm:@grayolson/pi-treebase
    - **X — Remove:** exclude it from the resulting branch.
 
    System/state records, structural reference targets, and inactive raw history
-   are locked and preserved automatically. Group navigation and tool dependency
+   are shown as **L — Locked** in a distinct color and preserved automatically.
+   Locks extend only to actual tool-call/result dependencies, not the whole turn.
+   Group navigation and tool dependency
    checks prevent contradictory P/X selections. Changing a final assistant
    response affects only that response; tool/intermediate messages stay grouped.
    Shift+Enter saves a raw/projected
