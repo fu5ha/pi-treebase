@@ -369,12 +369,12 @@ prefer concise context over a prescribed summary format. No new agent/session is
 
 When finished, write ${workspace.readyPath} containing exactly:
 {"operationId":${JSON.stringify(workspace.manifest.operationId)}}
-Then end normally with a short receipt. Do not invoke /pi-treebase yourself.
+Then end normally with a short receipt. Do not invoke /treebase yourself.
 The extension validates after a completed run, supplies bounded repair diagnostics,
-and asks the user to run /pi-treebase apply from an idle command context.
+and automatically attempts activation from a deferred idle command context.
 Interrupted/aborted runs cannot activate output. The user can cancel with
-/pi-treebase cancel. After extension/session reload the user must use
-/pi-treebase resume and let a fresh run complete before applying.
+/treebase cancel. After extension/session reload the user must use
+/treebase resume and let a fresh run complete before automatic activation.
 Instructions and editing activity stay off the final branch.
 Snapshots/artifacts are retained in ${workspace.directory} for recovery and inspection.
 `;
