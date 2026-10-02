@@ -86,6 +86,11 @@ This is a same-session branch workflow, not a separate session file:
   inactive raw history and structural reference targets.
 - The workspace serializes the live manager before editing, including in-memory
   sessions. Snapshot and manifest hashes are checked on every validation.
+  `choices.json` is a plain sparse array of `{id, action: "P" | "X"}` overrides;
+  omitted selected IDs imply M. Its schema exposes only those two fields.
+  Internal metadata lives in `manifest.json`, which records `choicesHash`
+  instead of embedding choices. Loading checks the persisted manifest hash first,
+  then the choices hash, with distinct integrity failures for each file.
   Editing uses ordered branch JSONL, not a duplicate native session file.
   Source references restore metadata; line order reconstructs parent links.
   The prefix before the rewrite range is read-only and unrelated branches are
@@ -140,10 +145,11 @@ the Phase 1 native navigation smoke remains the integration evidence.
 
 Ordered-workspace verification covers single-branch export, metadata/parent
 restoration, M reordering, read-only prefix/P/X rules, locked projection effects,
-anchor-bounded synthesis, snapshot/manifest tampering, token limits, tool excerpt
+anchor-bounded synthesis, plain sparse choices/minimal schema, separate
+snapshot/manifest/choices tampering, token limits, tool excerpt
 range validation, full-call preservation, multi-call completeness, CRLF/non-text
 handling, durable provenance, and native reconstruction/persisted reload.
-`npm.cmd run typecheck` and all 37 tests pass.
+`npm.cmd run typecheck` and all 40 tests pass.
 
 Not exercised here: actual terminal P/M/X interaction, a live current-agent
 editing run, visual cancellation/search/folding, theme switching and terminal resize.

@@ -33,7 +33,7 @@ pi install npm:@grayolson/pi-treebase
    Shift+Enter saves a raw/projected
    context preview and cancels selection.
 4. The current agent edits ordered branch JSONL using its existing context and
-   normal tools on a temporary branch. It receives schemas, a choices manifest,
+   normal tools on a temporary branch. It receives schemas, sparse choices,
    and editing instructions. No separate agent or restricted sandbox is used.
 5. After successful settlement, treebase automatically attempts to apply the
    result from a deferred idle command context. It revalidates the files and
@@ -51,7 +51,7 @@ committed operation again is rejected.
 ## Artifacts and validation
 
 The notified workspace directory retains `original.jsonl`, `context.jsonl`,
-`context.schema.json`, `choices.json`, `choices.schema.json`, `instructions.md`,
+`context.schema.json`, `choices.json`, `choices.schema.json`, `manifest.json`, `instructions.md`,
 and the completion signal `ready.json`. Retention is intentional, including on
 failure/cancellation; delete these directories manually when no longer needed.
 X is **not** a confidentiality boundary: originals, backups and the working
@@ -61,7 +61,11 @@ The editable file contains only the current branch, one editing record per line,
 in ancestor order. Line order determines parent relationships; treebase restores
 native session metadata from the immutable snapshot. The pre-selection prefix
 is read-only. No session header, parent links, or unrelated branches need editing.
-`choices.json` lists only P/X overrides; unlisted selected IDs imply M.
+`choices.json` is a plain array of only P/X overrides, for example
+`[{"id":"entry-id","action":"P"}]`; each item contains only `id` and `action`.
+Unlisted selected IDs imply M. The separate internal `manifest.json` records
+workspace metadata and a hash of `choices.json`; both files are integrity-checked
+before loading the workspace.
 Source-backed M records can be edited, removed, or reordered within P/locked
 anchor boundaries. New synthesized context becomes a displayed custom message
 with explicit M-source provenance.
