@@ -133,8 +133,19 @@ function makeModel(items: ActionItem[]): ActionModel {
     });
 
     const groups = new Map<GroupId, ActionGroup>();
+    let previousSourceGroupId: GroupId | undefined;
+    let contiguousGroupId: GroupId | undefined;
     for (const row of rows) {
-        const groupId = row.groupId ?? `row:${row.index}`;
+        const sourceGroupId = row.groupId ?? `row:${row.index}`;
+        // Source turn IDs can recur after state records or standalone messages.
+        // The gutter and mutations must address the same contiguous run, not
+        // every occurrence of that ID. Hidden envelopes belong to their raw
+        // run too; dependencies across a barrier are checked at confirmation.
+        if (sourceGroupId !== previousSourceGroupId) {
+            contiguousGroupId = `run:${row.index}:${sourceGroupId}`;
+        }
+        previousSourceGroupId = sourceGroupId;
+        const groupId = contiguousGroupId!;
         row.groupId = groupId;
         const existing = groups.get(groupId);
         if (existing) {
@@ -163,12 +174,14 @@ function makeModel(items: ActionItem[]): ActionModel {
             );
             const lastAssistantRow = visibleAssistantRows.at(-1);
             // A trailing tool-calling message is still an intermediate envelope,
-            // even when it contains text. Keep it with its tool results.
+            // even when it contains text. Nor is visible text final when hidden
+            // envelopes/results follow it: splitting there creates disjoint runs.
             const lastAssistantContent = lastAssistantRow?.entry.type === "message"
                 && lastAssistantRow.entry.message.role === "assistant"
                 ? lastAssistantRow.entry.message.content : undefined;
-            const finalRowIndex = Array.isArray(lastAssistantContent)
-                && lastAssistantContent.some((block) => block.type === "toolCall")
+            const finalRowIndex = lastAssistantRow?.index !== groupRows.at(-1)?.index
+                || (Array.isArray(lastAssistantContent)
+                && lastAssistantContent.some((block) => block.type === "toolCall"))
                 ? undefined : lastAssistantRow?.index;
             if (finalRowIndex !== undefined) rows[finalRowIndex].kind = "assistant-final";
             turn = {

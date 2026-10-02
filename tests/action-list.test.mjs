@@ -49,6 +49,7 @@ async function select(sm, keys, modify = items => items, expectedNotices = [], c
                     render();
                 }
                 component.handleInput("\r");
+                if (capture.cancelAfterConfirm) component.handleInput("\x1b");
             }),
         },
     };
@@ -171,4 +172,64 @@ test("editing intermediates preserves a locked final response", async () => {
     assert.deepEqual(result.map(item => item.action), ["model", "remove", "remove", "pick"]);
     assert.equal(result[1].groupId, result[2].groupId);
     assert.notEqual(result[2].groupId, result[3].groupId);
+});
+
+test("system barriers bound mutations and final splitting to the visible run", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    sm.appendMessage(assistant([text("before")]));
+    sm.appendCustomEntry("state.before", {});
+    sm.appendMessage({ ...assistant([call]), stopReason: "toolUse" });
+    sm.appendMessage({ role: "toolResult", toolCallId: "call", toolName: "read",
+        content: [text("result")], isError: false, timestamp: 1 });
+    sm.appendMessage(assistant([text("middle final")]));
+    sm.appendCustomEntry("state.after", {});
+    sm.appendMessage(assistant([text("after")]));
+    const capture = { frames: [] };
+    const result = await select(sm, ["\x1b[A", "\x1b[A", "p", "m"],
+        items => items.map(item => item.protected ? item : { ...item, action: "pick" }),
+        [], capture);
+    assert.deepEqual(result.map(item => item.action),
+        ["pick", "pick", "pick", "pick", "model", "pick", "pick"]);
+    assert.equal(result[2].groupId, result[3].groupId);
+    assert.notEqual(result[3].groupId, result[4].groupId);
+    assert.notEqual(result[0].groupId, result[2].groupId);
+    assert.notEqual(result[4].groupId, result[6].groupId);
+    assert.match(capture.frames.at(-1).join("\n"), /\[M\].*── assistant: middle final/);
+});
+
+test("standalone custom messages do not reconnect matching assistant turn IDs", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    sm.appendMessage(assistant([text("before")]));
+    sm.appendCustomMessageEntry("notice", "standalone", true);
+    sm.appendMessage(assistant([text("after")]));
+    const result = await select(sm, ["p", "m", "x"]);
+    assert.deepEqual(result.map(item => item.action), ["model", "model", "remove"]);
+    assert.notEqual(result[0].groupId, result[2].groupId);
+});
+
+test("hidden tool envelopes do not expand mutations across structural barriers", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    sm.appendMessage({ ...assistant([call]), stopReason: "toolUse" });
+    sm.appendCustomEntry("state", {});
+    sm.appendMessage({ role: "toolResult", toolCallId: "call", toolName: "read",
+        content: [text("result")], isError: false, timestamp: 1 });
+    sm.appendMessage(assistant([text("answer")]));
+    const result = await select(sm, ["\x1b[A", "x"]);
+    assert.deepEqual(result.map(item => item.action), ["model", "pick", "remove", "model"]);
+    assert.notEqual(result[0].groupId, result[2].groupId);
+    const branch = sm.getBranch();
+    const notice = `Tool call: ${branch[0].id} is P, but result ${branch[2].id} is X. Choose compatible actions.`;
+    const rejected = await select(sm, ["\x1b[A", "x"],
+        items => items.map((item, index) => index === 0 ? { ...item, action: "pick" } : item),
+        [notice], { cancelAfterConfirm: true });
+    assert.equal(rejected, null, "incompatible cross-barrier dependencies must still reject confirmation");
+});
+
+test("visible text before a hidden trailing envelope is not split as a final", async () => {
+    const sm = fixture({ final: false });
+    sm.appendMessage(assistant([text("still working")]));
+    sm.appendMessage({ ...assistant([{ ...call, id: "next" }]), stopReason: "toolUse" });
+    const result = await select(sm, ["x"]);
+    assert.deepEqual(result.map(item => item.action), ["model", "remove", "remove", "remove", "remove"]);
+    assert.equal(result[1].groupId, result[4].groupId);
 });

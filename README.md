@@ -25,7 +25,11 @@ pi install npm:@grayolson/pi-treebase
    Locks extend only to actual tool-call/result dependencies, not the whole turn.
    Group navigation and tool dependency
    checks prevent contradictory P/X selections. Changing a final assistant
-   response affects only that response; tool/intermediate messages stay grouped.
+   response affects only that response; contiguous tool/intermediate messages
+   stay grouped.
+   System/bookkeeping and standalone records separate action groups; changing a
+   group does not affect other groups across those boundaries. Tool dependencies
+   across boundaries are checked rather than silently changing surrounding groups.
    Shift+Enter saves a raw/projected
    context preview and cancels selection.
 4. The current agent edits a duplicate JSONL using its existing context and
