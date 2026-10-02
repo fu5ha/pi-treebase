@@ -259,12 +259,10 @@ export default function (pi: ExtensionAPI) {
             const stateId = sm.appendCustomEntry(STATE, state);
             await activate(ctx, stateId, originalLeaf);
             commandContexts.set(state.operationId, ctx);
-            pi.sendUserMessage(`Perform controlled context editing for treebase operation ${state.operationId} using your current context and normal tools.
-Read ${work.instructionsPath}, ${work.choicesPath}, and the schemas in ${work.directory}.
-Edit ${work.contextPath}, not the live session. Original snapshot: ${work.originalPath}.
-Inspect programmatically, batch precise edits, preserve retained facts concisely, and never reintroduce X material.
-When finished, write ${join(work.directory, "ready.json")} containing {"operationId":"${state.operationId}"} and end your turn.
-Do not invoke /treebase: the validated result will be activated automatically after your run settles.`);
+            pi.sendUserMessage(`Perform controlled editing on your own context for continued work based on treebase operation ${state.operationId}.
+- Read ${work.instructionsPath}
+- Inspect programmatically, batch precise edits, preserve retained facts concisely, and don't reintroduce removed material.
+When finished, write ${join(work.directory, "ready.json")} containing {"operationId":"${state.operationId}"} and end your turn. The validated result will be activated automatically after your run settles.`);
             ctx.ui.notify(`Treebase editing on a temporary branch.\nArtifacts: ${work.directory}`, "info");
         } catch (error) {
             ctx.ui.notify(`Treebase failed: ${error instanceof Error ? error.message : String(error)}`, "error");

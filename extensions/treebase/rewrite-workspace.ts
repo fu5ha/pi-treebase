@@ -466,11 +466,16 @@ function validateToolPairing(messages: ReturnType<typeof convertToLlm>) {
 function instructions(workspace: RewriteWorkspace): string {
     return `# Ordered branch context editing
 
-You are the actual current agent on a temporary working branch, with your normal tools.
-Edit ONLY ${workspace.contextPath}. Never change original.jsonl or choices.json.
-Read choices.json and context.schema.json. choices contains only P/X overrides;
-selectedIds absent from choices imply M. original.jsonl is the immutable full
-session snapshot; context.jsonl exports only the original current branch.
+The context you're editing is your own current context. You are trying to retain what is relevant
+for continued work after going back to the user selected point in history. Do not read the whole
+files you're editing into context at once; it's already there. Try to grown your own context as
+little as possible during the process of doing these edits to your future context.
+
+Edit ONLY ${workspace.contextPath}.
+
+Read choices.json and context.schema.json. choices contain user choices for what to keep and delete;
+selectedIds absent from choices imply you choose what to do. original.jsonl is the immutable full
+session snapshot; context.jsonl exports only the current branch.
 
 Each nonblank line is one editing record. Line order determines ancestry.
 Do not write native session records, IDs, parentId, timestamps or a session header.
