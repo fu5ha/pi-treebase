@@ -11,7 +11,7 @@ pi install npm:@grayolson/pi-treebase
 
 ## Workflow
 
-1. Run `/pi-treebase` (`/treebase` is an alias).
+1. Run `/treebase`.
 2. In the native tree view, select an entry in the current branch. Unrelated
    branches are rejected; the selected entry is included in the rewrite.
 3. Classify the range through the current leaf:
@@ -27,15 +27,17 @@ pi install npm:@grayolson/pi-treebase
 4. The current agent edits a duplicate JSONL using its existing context and
    normal tools on a temporary branch. It receives schemas, a choices manifest,
    and editing instructions. No separate agent or restricted sandbox is used.
-5. When notified that validation succeeded, run `/pi-treebase apply`.
-   This revalidates the files and creates/activates a fresh branch in the same
-   session. Editing prompts and tool activity do not enter the final context.
+5. After successful settlement, treebase automatically attempts to apply the
+   result from a deferred idle command context. It revalidates the files and
+   creates/activates a fresh branch in the same session. Editing prompts and
+   tool activity do not enter the final context.
 
-Final activation requires an idle command because pi's settled lifecycle event
-is notification-only. Interrupted or invalid runs are not applied. Use
-`/pi-treebase resume` to continue/repair, or `/pi-treebase cancel` to return to the
-original branch. Reloaded operations recover from persisted state but require
-`resume` to confirm a fresh settled editing run before activation; applying a
+Final activation is deferred outside pi's notification-only settled lifecycle
+event until the command context is idle; there is no manual apply subcommand.
+Interrupted or invalid runs are not applied. Use `/treebase resume` to
+continue/repair, or `/treebase cancel` to return to the original branch. Reloaded
+operations recover from persisted state but require `/treebase resume` to
+confirm a fresh settled editing run before automatic activation; applying a
 committed operation again is rejected.
 
 ## Artifacts and validation

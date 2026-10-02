@@ -67,20 +67,21 @@ This is a same-session branch workflow, not a separate session file:
    arbitrary message/model/system entry drafts or command-only navigation.
    `agent_end` is not final: retries, recovery, compaction and queued work can follow.
    `agent_settled` is final but notification-only.
-4. Completion should record readiness at an actionable boundary, then notify the
-   user at settlement. Final activation must happen from a fresh command context
-   after `waitForIdle`, not by calling `navigateTree`/`waitForIdle` from a lifecycle
+4. Completion records readiness at an actionable boundary. Successful settlement
+   schedules an automatic apply attempt from a deferred command context after
+   `waitForIdle`, not by calling `navigateTree`/`waitForIdle` from a lifecycle
    hook. Those command-only calls can deadlock inside the run they await.
 5. Idle command-scoped writable manager methods can append ordinary system,
    user, assistant, tool-result, bash and custom messages plus structural records.
    Exact arbitrary checkpoint/augmented-role commits have the gaps above.
-   An upstream idle command-dispatch or transactional same-session branch API is
-   needed for fully automatic, safe hook-to-activation handoff without a second
-   user command. Do not silently substitute a separate session.
+   The automatic handoff uses the command context retained for the current run,
+   deferred outside the lifecycle hook. Reload cannot recover that context:
+   a fresh `/treebase resume` command and settled editing run are required.
+   Do not silently substitute a separate session.
 
 ## Phase 2 implementation
 
-- `/pi-treebase` and `/treebase` now classify with P/M/X. Unrelated tree
+- `/treebase` is the sole command and classifies with P/M/X. Unrelated tree
   destinations are rejected, not navigated to. Locked rows distinguish state,
   inactive raw history and structural reference targets.
 - The workspace serializes the live manager before editing, including in-memory
@@ -91,9 +92,11 @@ This is a same-session branch workflow, not a separate session file:
   branch activation. `ready.json` is an explicit completion request, not
   authorization to activate. A completed actionable boundary validates it and
   persists readiness; at most two repair continuations are requested.
-- `agent_settled` only notifies and records an in-memory confirmation. Applying
-  requires `/pi-treebase apply`, idle state, matching working ancestry, settlement
-  confirmation, and fresh validation. After reload, `/pi-treebase resume` must
+- `agent_settled` records an in-memory confirmation and schedules an automatic
+  apply attempt from a deferred idle command context. Applying requires matching
+  working ancestry, settlement confirmation, and fresh validation; there is no
+  manual apply subcommand. `/treebase resume` continues or repairs a run, and
+  `/treebase cancel` returns to the original branch. After reload, resume must
   produce a fresh settled run: persisted pre-settlement readiness alone is unsafe.
 - Final reconstruction is preflighted on a detached manager and uses public
   append APIs plus native navigation. A session-wide committed receipt prevents
