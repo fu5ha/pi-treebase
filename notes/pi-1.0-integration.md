@@ -86,8 +86,15 @@ This is a same-session branch workflow, not a separate session file:
   inactive raw history and structural reference targets.
 - The workspace serializes the live manager before editing, including in-memory
   sessions. Snapshot and manifest hashes are checked on every validation.
-  Extraction uses stable source IDs and explicit M insertion provenance;
-  synthesized custom messages cannot cross ordered P/locked anchors.
+  Editing uses ordered branch JSONL, not a duplicate native session file.
+  Source references restore metadata; line order reconstructs parent links.
+  The prefix before the rewrite range is read-only and unrelated branches are
+  absent. M records may reorder within P/locked boundaries; synthesized custom
+  messages carry explicit M provenance and cannot cross those boundaries.
+  Tool excerpts extract validated line ranges from snapshot text and retain the
+  full original call input, matching result metadata and extraction provenance.
+  Workspace protocols are unversioned with no legacy readers. Finish/cancel
+  pending operations before upgrading; snapshots remain recovery artifacts.
 - The same current agent receives a normal user prompt after native temporary
   branch activation. `ready.json` is an explicit completion request, not
   authorization to activate. A completed actionable boundary validates it and
@@ -130,6 +137,13 @@ context-edit/compaction effects plus accepted/rejected provenance insertions.
 Cancellation remains terminal even when an earlier working leaf is revisited.
 Lifecycle tests exercise the actual handlers with command/navigation doubles;
 the Phase 1 native navigation smoke remains the integration evidence.
+
+Ordered-workspace verification covers single-branch export, metadata/parent
+restoration, M reordering, read-only prefix/P/X rules, locked projection effects,
+anchor-bounded synthesis, snapshot/manifest tampering, token limits, tool excerpt
+range validation, full-call preservation, multi-call completeness, CRLF/non-text
+handling, durable provenance, and native reconstruction/persisted reload.
+`npm.cmd run typecheck` and all 37 tests pass.
 
 Not exercised here: actual terminal P/M/X interaction, a live current-agent
 editing run, visual cancellation/search/folding, theme switching and terminal resize.
