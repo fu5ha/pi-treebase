@@ -1,9 +1,12 @@
-import { complete, ToolCall, ToolResultMessage, type UserMessage } from "@earendil-works/pi-ai";
+import { ToolCall, ToolResultMessage, type UserMessage, type Usage } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
     BorderedLoader,
+    convertToLlm,
+    serializeConversation,
+    sessionEntryToContextMessages,
     SessionMessageEntry,
     type ExtensionCommandContext,
     type SessionEntry,
@@ -17,6 +20,7 @@ export type RewritePart =
           toolCallItem: ActionItem;
           toolResultItem: ActionItem;
           toolCallId: string;
+          position: "call" | "result";
       }
     | {
           kind: "summary";
@@ -50,6 +54,9 @@ export type TreebaseDebugFiles = {
 export type BuildRewriteResult = {
     parts: RewritePart[];
     debugFiles: TreebaseDebugFiles;
+    usage?: Usage;
+    usageProvider?: string;
+    usageModel?: string;
 };
 
 const SYSTEM_PROMPT = `You summarize conversation history segments between a user and an expert coding agent inside the pi coding agent harness.
@@ -95,320 +102,47 @@ Use the following format as guide for each summary:
 - **[Decision]**: [Brief rationale]
 `;
 
-type AgentMessage = any;
+type AgentMessage = ReturnType<typeof sessionEntryToContextMessages>[number];
 type FileOps = { read: Set<string>; written: Set<string>; edited: Set<string> };
 
-function createFileOps(): FileOps {
-    return { read: new Set(), written: new Set(), edited: new Set() };
-}
-
-function createCustomMessage(
-    customType: string,
-    content: any,
-    display: boolean,
-    details: any,
-    timestamp: string,
-): AgentMessage {
-    return {
-        role: "custom",
-        customType,
-        content,
-        display,
-        details,
-        timestamp: new Date(timestamp).getTime(),
-    };
-}
-
-function createBranchSummaryMessage(
-    summary: string,
-    fromId: string,
-    timestamp: string,
-): AgentMessage {
-    return {
-        role: "branchSummary",
-        summary,
-        fromId,
-        timestamp: new Date(timestamp).getTime(),
-    };
-}
-
-function createCompactionSummaryMessage(
-    summary: string,
-    tokensBefore: number,
-    timestamp: string,
-): AgentMessage {
-    return {
-        role: "compactionSummary",
-        summary,
-        tokensBefore,
-        timestamp: new Date(timestamp).getTime(),
-    };
-}
-
-/** Copied from pi's compaction getMessageFromEntry shape, with branch-summary behavior. */
-export function getMessageFromEntry(
-    entry: SessionEntry,
-): AgentMessage | undefined {
-    switch (entry.type) {
-        case "message":
-            // Match pi branch summarization: skip tool results; assistant tool calls carry the context.
-            if (entry.message.role === "toolResult") return undefined;
-            // Drop empty assistant/thinking-only envelopes. They do not serialize to useful
-            // summary context and otherwise show up as empty assistant turns.
-            if (
-                entry.message.role === "assistant" &&
-                !hasSubstantiveAssistantContent(entry.message)
-            )
-                return undefined;
-            return entry.message;
-        case "custom_message":
-            return createCustomMessage(
-                entry.customType,
-                entry.content,
-                entry.display,
-                entry.details,
-                entry.timestamp,
-            );
-        case "branch_summary":
-            return createBranchSummaryMessage(
-                entry.summary,
-                entry.fromId,
-                entry.timestamp,
-            );
-        case "compaction":
-            return createCompactionSummaryMessage(
-                entry.summary,
-                entry.tokensBefore,
-                entry.timestamp,
-            );
-        case "thinking_level_change":
-        case "model_change":
-        case "custom":
-        case "label":
-        case "session_info":
-            return undefined;
-    }
-}
-
 function hasSubstantiveAssistantContent(message: AgentMessage): boolean {
-    if (!Array.isArray(message.content)) return false;
-    if (message.errorMessage) return true;
-    if (
-        message.stopReason &&
-        message.stopReason !== "stop" &&
-        message.stopReason !== "toolUse"
-    )
-        return true;
-    return message.content.some((block: any) => {
-        if (!block || typeof block !== "object") return false;
-        if (block.type === "text") return Boolean(block.text?.trim());
-        if (block.type === "toolCall") return true;
-        return false;
-    });
+    return message.role === "assistant" && message.content.some(
+        block => block.type === "toolCall" || (block.type === "text" && Boolean(block.text.trim())),
+    );
 }
 
-function estimateTokens(message: AgentMessage): number {
-    let chars = 0;
-    switch (message.role) {
-        case "user":
-        case "custom":
-        case "toolResult": {
-            const content = message.content;
-            if (typeof content === "string") chars = content.length;
-            else if (Array.isArray(content))
-                for (const block of content)
-                    if (block.type === "text") chars += block.text?.length ?? 0;
-            return Math.ceil(chars / 4);
-        }
-        case "assistant":
-            for (const block of message.content ?? []) {
-                if (block.type === "text") chars += block.text?.length ?? 0;
-                else if (block.type === "thinking")
-                    chars += block.thinking?.length ?? 0;
-                else if (block.type === "toolCall")
-                    chars +=
-                        (block.name?.length ?? 0) +
-                        JSON.stringify(block.arguments ?? {}).length;
-            }
-            return Math.ceil(chars / 4);
-        case "bashExecution":
-            return Math.ceil(
-                ((message.command?.length ?? 0) +
-                    (message.output?.length ?? 0)) /
-                    4,
-            );
-        case "branchSummary":
-        case "compactionSummary":
-            return Math.ceil((message.summary?.length ?? 0) / 4);
-        default:
-            return 0;
-    }
-}
-
-function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOps) {
-    if (message.role !== "assistant" || !Array.isArray(message.content)) return;
-    for (const block of message.content) {
-        if (!block || block.type !== "toolCall") continue;
-        const p =
-            typeof block.arguments?.path === "string"
-                ? block.arguments.path
-                : undefined;
-        if (!p) continue;
-        if (block.name === "read") fileOps.read.add(p);
-        else if (block.name === "write") fileOps.written.add(p);
-        else if (block.name === "edit") fileOps.edited.add(p);
-    }
-}
-
-// Copied from pi's prepareBranchEntries
-// TODO(slop-cleanup): this is used very wrong, it should be used once, after action list entries that were
-// dropped have been culled and we've determined tool use retention candidates.
-// probably it should take actionItems instead of session entries and token budget should actually be used properly
+/** File accounting is extension-owned, including details on extension summaries. */
 export function prepareBranchEntries(
     entries: SessionEntry[],
-    tokenBudget = 0,
-): { messages: AgentMessage[]; fileOps: FileOps; totalTokens: number } {
-    const messages: AgentMessage[] = [];
-    const fileOps = createFileOps();
-    let totalTokens = 0;
-
+): { messages: AgentMessage[]; fileOps: FileOps } {
+    const fileOps: FileOps = { read: new Set(), written: new Set(), edited: new Set() };
+    const messages = entries.flatMap(sessionEntryToContextMessages);
     for (const entry of entries) {
-        if (
-            entry.type === "branch_summary" &&
-            !entry.fromHook &&
-            entry.details
-        ) {
-            const details = entry.details as {
-                readFiles?: unknown;
-                modifiedFiles?: unknown;
-            };
+        if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.details) {
+            const details = entry.details as { readFiles?: unknown; modifiedFiles?: unknown };
             if (Array.isArray(details.readFiles))
-                for (const f of details.readFiles)
-                    if (typeof f === "string") fileOps.read.add(f);
+                for (const f of details.readFiles) if (typeof f === "string") fileOps.read.add(f);
             if (Array.isArray(details.modifiedFiles))
-                for (const f of details.modifiedFiles)
-                    if (typeof f === "string") fileOps.edited.add(f);
+                for (const f of details.modifiedFiles) if (typeof f === "string") fileOps.edited.add(f);
         }
     }
-
-    for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = entries[i];
-        const message = getMessageFromEntry(entry);
-        if (!message) continue;
-        extractFileOpsFromMessage(message, fileOps);
-        const tokens = estimateTokens(message);
-        if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
-            if (
-                (entry.type === "compaction" ||
-                    entry.type === "branch_summary") &&
-                totalTokens < tokenBudget * 0.9
-            ) {
-                messages.unshift(message);
-                totalTokens += tokens;
-            }
-            break;
-        }
-        messages.unshift(message);
-        totalTokens += tokens;
+    for (const message of messages) {
+        if (message.role === "assistant")
+            for (const block of message.content)
+                if (block.type === "toolCall") accountTool(block.name, block.arguments, fileOps);
+        if (message.role === "toolResult")
+            for (const call of message.nestedCalls?.calls ?? [])
+                accountTool(call.name, call.arguments, fileOps);
     }
-
-    return { messages, fileOps, totalTokens };
+    return { messages, fileOps };
 }
 
-function convertToLlm(messages: AgentMessage[]): AgentMessage[] {
-    return messages
-        .map((m) => {
-            switch (m.role) {
-                case "bashExecution":
-                    if (m.excludeFromContext) return undefined;
-                    return {
-                        role: "user",
-                        content: [
-                            {
-                                type: "text",
-                                text: `Ran \`${m.command}\`\n\n${m.output || "(no output)"}`,
-                            },
-                        ],
-                        timestamp: m.timestamp,
-                    };
-                case "custom":
-                    return {
-                        role: "user",
-                        content:
-                            typeof m.content === "string"
-                                ? [{ type: "text", text: m.content }]
-                                : m.content,
-                        timestamp: m.timestamp,
-                    };
-                case "branchSummary":
-                    return {
-                        role: "user",
-                        content: [
-                            {
-                                type: "text",
-                                text: `The following is a summary of a branch that this conversation came back from:\n\n<summary>\n${m.summary}\n</summary>`,
-                            },
-                        ],
-                        timestamp: m.timestamp,
-                    };
-                case "compactionSummary":
-                    return {
-                        role: "user",
-                        content: [
-                            {
-                                type: "text",
-                                text: `The conversation history before this point was compacted into the following summary:\n\n<summary>\n${m.summary}\n</summary>`,
-                            },
-                        ],
-                        timestamp: m.timestamp,
-                    };
-                case "user":
-                case "assistant":
-                case "toolResult":
-                    return m;
-                default:
-                    return undefined;
-            }
-        })
-        .filter(Boolean);
-}
-
-function serializeConversation(messages: AgentMessage[]): string {
-    const parts: string[] = [];
-    for (const msg of messages) {
-        if (msg.role === "user") {
-            const content =
-                typeof msg.content === "string"
-                    ? msg.content
-                    : (msg.content ?? [])
-                          .filter((c: any) => c.type === "text")
-                          .map((c: any) => c.text)
-                          .join("");
-            if (content) parts.push(`[User]: ${content}`);
-        } else if (msg.role === "assistant") {
-            const textParts: string[] = [];
-            const thinkingParts: string[] = [];
-            const toolCalls: string[] = [];
-            for (const block of msg.content ?? []) {
-                if (block.type === "text") textParts.push(block.text);
-                else if (block.type === "thinking")
-                    thinkingParts.push(block.thinking);
-                else if (block.type === "toolCall")
-                    toolCalls.push(
-                        `${block.name}(${Object.entries(block.arguments ?? {})
-                            .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-                            .join(", ")})`,
-                    );
-            }
-            if (thinkingParts.length > 0)
-                parts.push(`[Assistant thinking]: ${thinkingParts.join("\n")}`);
-            if (textParts.length > 0)
-                parts.push(`[Assistant]: ${textParts.join("\n")}`);
-            if (toolCalls.length > 0)
-                parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
-        }
-    }
-    return parts.join("\n\n");
+function accountTool(name: string, args: unknown, fileOps: FileOps) {
+    const p = (args as { path?: unknown } | undefined)?.path;
+    if (typeof p !== "string") return;
+    if (name === "read") fileOps.read.add(p);
+    else if (name === "write") fileOps.written.add(p);
+    else if (name === "edit") fileOps.edited.add(p);
 }
 
 function computeFileLists(fileOps: FileOps): { readFiles: string[]; modifiedFiles: string[] } {
@@ -465,7 +199,7 @@ function splitByImportance(
 }
 
 function textFromToolResult(message: AgentMessage | undefined): string {
-    const content = message?.content;
+    const content = message && "content" in message ? message.content : undefined;
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return "";
     return content
@@ -522,7 +256,8 @@ function findHighToolRetentionCandidates(items: ActionItem[]): ToolRetentionCand
             if (seen.has(block.id)) continue;
             const relativeToolResultItemIndex = items.slice(itemIndex + 1).findIndex(candidate => {
                 if (
-                    candidate.entry.type !== "message"
+                    candidate.entry.type !== "message" ||
+                    candidate.action !== "summarize-high"
                 )
                     return false;
                 const resultMsg = candidate.entry.message;
@@ -559,12 +294,15 @@ function serializeItemsForSummary(
     const parts: string[] = [];
     for (const item of itemsToSerialize) {
         if (item.entry.type !== "message") {
-            const msg = getMessageFromEntry(item.entry);
-            if (msg) parts.push(serializeConversation(convertToLlm([msg])));
+            const messages = sessionEntryToContextMessages(item.entry);
+            parts.push(serializeConversation(convertToLlm(messages)));
             continue;
         }
         const msg = item.entry.message as any;
-        if (msg.role === "toolResult") continue;
+        if (msg.role === "toolResult") {
+            parts.push(serializeConversation(convertToLlm([msg])));
+            continue;
+        }
         const candidates = candidatesByAssistantId.get(item.id) ?? [];
         if (candidates.length === 0) {
             const prepared = prepareBranchEntries([item.entry]);
@@ -664,12 +402,34 @@ export function buildSummarizerContext(
     return { message: parts.join("\n\n"), toolRetentionCandidates };
 }
 
+/** Build model-facing rows without mutating raw records selected for copying. */
+export function projectActionItems(ctx: ExtensionCommandContext, items: ActionItem[]): ActionItem[] {
+    const projected = new Map(ctx.sessionManager.buildSessionProjection().entries.map(
+        entry => [entry.sourceEntry.id, entry.messages],
+    ));
+    return items.map(item => {
+        const visible = (projected.get(item.id) ?? []).filter(message => message.role !== "system");
+        const entry: SessionEntry = visible.length === 0
+            ? { ...item.entry, type: "custom", customType: "treebase-invisible", data: undefined }
+            : item.entry.type === "message"
+                ? { ...item.entry, message: visible[0] }
+                : item.entry.type === "custom_message" && visible[0].role === "custom"
+                    ? { ...item.entry, content: visible[0].content }
+                    : item.entry;
+        return { ...item, entry };
+    });
+}
+
 export async function buildRewrite(
     ctx: ExtensionCommandContext,
     items: ActionItem[],
 ): Promise<BuildRewriteResult | null> {
+    if (ctx.mode !== "tui") throw new Error("Treebase summarization requires TUI mode");
+    // Model input follows pi's finalized projection. Reconstruction still picks
+    // the original raw entries, so omissions and historical records survive.
+    const modelItems = projectActionItems(ctx, items);
     const groups = groupSummaries(items);
-    const summarizerContext = buildSummarizerContext(items);
+    const summarizerContext = buildSummarizerContext(modelItems);
     const { toolRetentionCandidates } = summarizerContext;
     const candidateById = new Map(
         toolRetentionCandidates.map((candidate) => [candidate.shortId, candidate]),
@@ -677,11 +437,13 @@ export async function buildRewrite(
     const summaries = new Map<string, string>();
     const keepToolUseIds = new Set<string>();
     const debugFiles: TreebaseDebugFiles = {};
+    let usage: Usage | undefined;
 
     if (groups.length > 0) {
         if (!ctx.model) throw new Error("No model selected for summarization");
         type SummarizerModelResult = {
             responseText: string;
+            usage?: Usage;
             summarizerMessagePath?: string;
             summarizerResponsePath?: string;
         };
@@ -701,33 +463,21 @@ export async function buildRewrite(
                 );
                 fs.writeFileSync(summarizerMessagePath, body, "utf-8");
                 const run = async () => {
-                    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(
-                        ctx.model,
-                    );
-                    if (!auth.ok || !auth.apiKey)
-                        throw new Error(
-                            auth.ok
-                                ? `No API key for ${ctx.model.provider}`
-                                : String(
-                                      (auth as { error?: unknown }).error ??
-                                          "auth failed",
-                                  ),
-                        );
                     const msg: UserMessage = {
                         role: "user",
                         content: [{ type: "text", text: body }],
                         timestamp: Date.now(),
                     };
-                    const response = await complete(
+                    const response = await ctx.modelRegistry.streamSimple(
                         ctx.model,
                         { systemPrompt: SYSTEM_PROMPT, messages: [msg] },
                         {
-                            apiKey: auth.apiKey,
-                            headers: auth.headers,
                             signal: loader.signal,
                         },
-                    );
+                    ).result();
                     if (response.stopReason === "aborted") return null;
+                    if (response.stopReason === "error")
+                        throw new Error(response.errorMessage ?? "Summarization failed");
                     const responseText = response.content
                         .filter((c: any) => c.type === "text")
                         .map((c: any) => c.text)
@@ -739,6 +489,7 @@ export async function buildRewrite(
                     fs.writeFileSync(summarizerResponsePath, responseText, "utf-8");
                     return {
                         responseText,
+                        usage: response.usage,
                         summarizerMessagePath,
                         summarizerResponsePath,
                     };
@@ -765,6 +516,7 @@ export async function buildRewrite(
             },
         );
         if (result === null) return null;
+        usage = result.usage;
         Object.assign(debugFiles, {
             summarizerMessagePath: result.summarizerMessagePath,
             summarizerResponsePath: result.summarizerResponsePath,
@@ -784,8 +536,17 @@ export async function buildRewrite(
             );
         }
         if (parsed.error) throw new Error(parsed.error);
-        for (const g of parsed.summary_groups ?? [])
-            summaries.set(g.id, String(g.summary ?? ""));
+        if (!Array.isArray(parsed.summary_groups))
+            throw new Error("Summarizer did not return summary_groups");
+        const expected = new Set(groups.map(group => group.id));
+        for (const g of parsed.summary_groups) {
+            if (!g || !expected.has(g.id) || summaries.has(g.id) ||
+                typeof g.summary !== "string" || !g.summary.trim())
+                throw new Error("Summarizer returned an invalid, duplicate, or empty summary group");
+            summaries.set(g.id, g.summary);
+        }
+        if (summaries.size !== expected.size)
+            throw new Error("Summarizer omitted a requested summary group");
         for (const id of parsed.keep_tool_use_ids ?? []) {
             if (typeof id === "string" && candidateById.has(id))
                 keepToolUseIds.add(id);
@@ -824,7 +585,9 @@ export async function buildRewrite(
         const summaryItems = g.items.filter((x) => !retainedToolResultEntryIds.has(x.id));
         if (summaryItems.length === 0) return;
         emittedGroups.add(gid);
-        const prepared = prepareBranchEntries(summaryItems.map((x) => x.entry));
+        const prepared = prepareBranchEntries(summaryItems.map(
+            x => modelItems.find(item => item.id === x.id)!.entry,
+        ));
         const { readFiles, modifiedFiles } = computeFileLists(prepared.fileOps);
         parts.push({
             kind: "summary",
@@ -847,12 +610,24 @@ export async function buildRewrite(
             if (!toolResultItem) continue;
             parts.push({
                 kind: "retained-tool-use",
-                toolCallItem: item,
-                toolResultItem,
+                toolCallItem: modelItems[i],
+                toolResultItem: modelItems[candidate.toolResultItemIndex],
                 toolCallId: candidate.toolCallId,
+                position: "call",
             });
         }
         if (retainedToolResultEntryIds.has(item.id)) {
+            for (const id of keepToolUseIds) {
+                const candidate = candidateById.get(id)!;
+                if (candidate.toolResultItemIndex !== i) continue;
+                parts.push({
+                    kind: "retained-tool-use",
+                    toolCallItem: modelItems[candidate.toolCallItemIndex],
+                    toolResultItem: modelItems[i],
+                    toolCallId: candidate.toolCallId,
+                    position: "result",
+                });
+            }
             const gid = groupByItem.get(item.id);
             if (gid && summaryEmitItemByGroup.get(gid) === item.id) emitSummary(gid);
             continue;
@@ -861,5 +636,9 @@ export async function buildRewrite(
         const gid = groupByItem.get(item.id)!;
         if (summaryEmitItemByGroup.get(gid) === item.id) emitSummary(gid);
     }
-    return { parts, debugFiles };
+    return {
+        parts, debugFiles, usage,
+        usageProvider: usage ? ctx.model?.provider : undefined,
+        usageModel: usage ? ctx.model?.id : undefined,
+    };
 }

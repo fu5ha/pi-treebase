@@ -10,6 +10,7 @@
         "LICENSE"
     ],
     "scripts": {
+        "test": "node --test tests/*.test.mjs",
         "typecheck": "tsc --noEmit"
     },
     "keywords": [
@@ -22,12 +23,17 @@
         "image": "https://github.com/fu5ha/pi-treebase/raw/main/content/demo.gif"
     },
     "peerDependencies": {
-        "@earendil-works/pi-ai": "*",
-        "@earendil-works/pi-coding-agent": "*",
-        "@earendil-works/pi-tui": "*",
-        "typebox": "*"
+        "@earendil-works/pi-ai": "1.0.0",
+        "@earendil-works/pi-coding-agent": "1.0.0",
+        "@earendil-works/pi-tui": "1.0.0"
+    },
+    "engines": {
+        "node": ">=22.19.0"
     },
     "devDependencies": {
+        "@earendil-works/pi-ai": "1.0.0",
+        "@earendil-works/pi-coding-agent": "1.0.0",
+        "@earendil-works/pi-tui": "1.0.0",
         "typescript": "^5.0.0"
     }
 }

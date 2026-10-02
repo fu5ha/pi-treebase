@@ -1,9 +1,11 @@
 import type {
-    SessionEntry,
     SessionManager,
+    SessionEntry,
+    SessionProjection,
 } from "@earendil-works/pi-coding-agent";
 
 export type { SessionEntry };
+type HistoryReader = Pick<SessionManager, "getEntry" | "getBranch">;
 export type TreeNode = {
     entry: SessionEntry;
     children: TreeNode[];
@@ -24,10 +26,12 @@ export type ActionItem = {
     action: TreebaseAction;
     groupId: string;
     depth: number;
+    /** Structural/state records can only be preserved, never summarized or dropped. */
+    protected?: boolean;
 };
 
 export function isAncestor(
-    sessionManager: SessionManager,
+    sessionManager: HistoryReader,
     ancestorId: string | null,
     descendantId: string | null,
 ): boolean {
@@ -44,7 +48,7 @@ export function isAncestor(
 }
 
 export function entriesBetweenAncestorAndLeaf(
-    sessionManager: SessionManager,
+    sessionManager: HistoryReader,
     ancestorId: string,
     leafId: string,
 ): SessionEntry[] {
@@ -54,7 +58,7 @@ export function entriesBetweenAncestorAndLeaf(
 }
 
 export function parentOf(
-    sessionManager: SessionManager,
+    sessionManager: HistoryReader,
     entryId: string,
 ): string | null {
     return sessionManager.getEntry(entryId)?.parentId ?? null;
@@ -76,18 +80,19 @@ export function actionLetter(action: TreebaseAction): string {
 export function isTreebaseActionableEntry(entry: SessionEntry): boolean {
     switch (entry.type) {
         case "message":
+            return ["user", "assistant", "toolResult", "bashExecution"].includes(entry.message.role);
         case "custom_message":
         case "branch_summary":
-        case "compaction":
             return true;
-        // These entries either do not participate in LLM context, are session
-        // metadata, or are settings that should not be exposed as treebase
-        // action rows / summary input.
+        // Structural/state entries are shown, but never offered normal actions.
         case "thinking_level_change":
         case "model_change":
         case "label":
         case "session_info":
         case "custom":
+        case "context_edit":
+        case "usage":
+        case "compaction":
             return false;
         default:
             return false;
@@ -98,17 +103,32 @@ export function filterActionableEntries(entries: SessionEntry[]): SessionEntry[]
     return entries.filter(isTreebaseActionableEntry);
 }
 
-export function makeActionItems(entries: SessionEntry[]): ActionItem[] {
-    const actionableEntries = filterActionableEntries(entries);
+export function makeActionItems(entries: SessionEntry[], projection?: SessionProjection): ActionItem[] {
+    const visibleIds = projection
+        ? new Set(projection.entries.filter((entry) => entry.messages.length > 0).map((entry) => entry.sourceEntry.id))
+        : undefined;
+    const referencedIds = new Set(entries.flatMap((entry) => {
+        if (entry.type === "context_edit" || entry.type === "label") return [entry.targetId];
+        if (entry.type === "compaction") return [entry.firstKeptEntryId];
+        return [];
+    }));
     let turn = 0;
     let assistantGroupId: string | null = null;
 
-    return actionableEntries.map((entry, index) => {
+    const items: ActionItem[] = entries.map((entry, index) => {
+        const protectedEntry = !isTreebaseActionableEntry(entry)
+            || referencedIds.has(entry.id)
+            || (visibleIds !== undefined && !visibleIds.has(entry.id));
         const role =
             entry.type === "message" ? entry.message?.role : entry.type;
         let groupId: string;
 
-        if (role === "user") {
+        if (role === "system" || (entry.type !== "message" && !isTreebaseActionableEntry(entry))
+            || (entry.type === "message" && !["user", "assistant", "toolResult", "bashExecution"].includes(role))) {
+            // State updates are separate rows, but must not sever an assistant
+            // call/result group that spans them.
+            groupId = `preserve-${entry.id}`;
+        } else if (role === "user") {
             turn++;
             assistantGroupId = null;
             groupId = `turn-${turn}-user`;
@@ -128,8 +148,18 @@ export function makeActionItems(entries: SessionEntry[]): ActionItem[] {
             groupId = `turn-${turn}-${entry.type}-${entry.id}`;
         }
 
-        return { index, id: entry.id, entry, action: "summarize-low", groupId, depth: 0 };
+        return {
+            index, id: entry.id, entry,
+            action: protectedEntry ? "pick" : "summarize-low",
+            groupId, depth: 0, protected: protectedEntry,
+        };
     });
+    // A referenced or inactive assistant envelope must keep its matching tool
+    // results, even when only one member was directly protected.
+    const protectedGroups = new Set(items.filter((item) => item.protected).map((item) => item.groupId));
+    return items.map((item) => protectedGroups.has(item.groupId)
+        ? { ...item, protected: true, action: "pick" }
+        : item);
 }
 
 export function setGroupAction(
@@ -138,7 +168,7 @@ export function setGroupAction(
     action: TreebaseAction,
 ): ActionItem[] {
     return items.map((item) =>
-        item.groupId === groupId ? { ...item, action } : item,
+        item.groupId === groupId && !item.protected ? { ...item, action } : item,
     );
 }
 
@@ -159,6 +189,7 @@ export function entryTitle(entry: SessionEntry): string {
     if (entry.type === "message") {
         const msg = entry.message as any;
         const role = msg?.role ?? "message";
+        if (role === "system") return systemUpdateTitle(msg);
         if (role === "toolResult")
             return `[tool result: ${msg.toolName ?? msg.toolCallId ?? "tool"}]`;
         return `${role}: ${textFromContent(msg?.content) || "(no text)"}`;
@@ -172,7 +203,27 @@ export function entryTitle(entry: SessionEntry): string {
     if (entry.type === "model_change") return `[model: ${entry.modelId}]`;
     if (entry.type === "thinking_level_change")
         return `[thinking: ${entry.thinkingLevel}]`;
+    if (entry.type === "context_edit")
+        return `[context edit: ${entry.replacement === null ? "omit" : "replace"} ${entry.targetId}]`;
+    if (entry.type === "usage")
+        return `[usage: ${entry.kind}, ${entry.provider}/${entry.model}]`;
     return `[${entry.type}]`;
+}
+
+/** Describe prompt/tool deltas without putting the entire system prompt in a row. */
+export function systemUpdateTitle(message: {
+    sections?: Record<string, string | null>;
+    toolsAdded?: { name: string }[];
+    toolsRemoved?: { name: string }[];
+    replace?: boolean;
+}): string {
+    const changes: string[] = [message.replace ? "replacement" : "update"];
+    for (const [name, content] of Object.entries(message.sections ?? {})) {
+        changes.push(`${content === null ? "remove" : "replace"} section ${name}`);
+    }
+    if (message.toolsAdded?.length) changes.push(`tools +${message.toolsAdded.map((t) => t.name).join(", ")}`);
+    if (message.toolsRemoved?.length) changes.push(`tools -${message.toolsRemoved.map((t) => t.name).join(", ")}`);
+    return `[system: ${changes.join("; ")}]`;
 }
 
 export function serializeEntryForSummary(entry: SessionEntry): string {

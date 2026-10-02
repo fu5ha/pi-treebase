@@ -1,11 +1,11 @@
 import {
     DynamicBorder,
     type ExtensionCommandContext,
+    type KeybindingsManager,
     type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
     Container,
-    getKeybindings,
     Key,
     matchesKey,
     Text,
@@ -14,8 +14,8 @@ import {
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildSummarizerContext } from "./summarize.js";
-import { actionLetter, type ActionItem, type TreebaseAction } from "./tree-utils.js";
+import { buildSummarizerContext, projectActionItems } from "./summarize.js";
+import { actionLetter, entryTitle, isTreebaseActionableEntry, type ActionItem, type TreebaseAction } from "./tree-utils.js";
 
 type Theme = any;
 type ToolCallInfo = { name: string; arguments: Record<string, any> };
@@ -129,7 +129,7 @@ function makeModel(items: ActionItem[]): ActionModel {
             kind: classifyRow(item.entry, visible),
             groupId: item.groupId,
             visible,
-            actionable: true,
+            actionable: !item.protected && isTreebaseActionableEntry(item.entry),
         };
     });
 
@@ -139,7 +139,7 @@ function makeModel(items: ActionItem[]): ActionModel {
         row.groupId = groupId;
         const existing = groups.get(groupId);
         if (existing) existing.rowIndexes.push(row.index);
-        else groups.set(groupId, { id: groupId, rowIndexes: [row.index], action: row.source.action });
+        else groups.set(groupId, { id: groupId, rowIndexes: [row.index], action: row.actionable ? row.source.action : "pick" });
     }
 
     const turns: Turn[] = [];
@@ -205,7 +205,7 @@ function getVisibleRows(model: ActionModel): VisibleActionRow[] {
 
 function setGroupAction(model: ActionModel, groupId: GroupId, action: TreebaseAction): void {
     const group = model.groups.get(groupId);
-    if (group) group.action = action;
+    if (group && group.rowIndexes.every((index) => model.rows[index].actionable)) group.action = action;
 }
 
 function replaceTurnGroups(model: ActionModel, turn: Turn, groups: ActionGroup[]): void {
@@ -220,6 +220,7 @@ function replaceTurnGroups(model: ActionModel, turn: Turn, groups: ActionGroup[]
 }
 
 function setWholeTurnAction(model: ActionModel, turn: Turn, action: TreebaseAction): void {
+    if (turn.rowIndexes.some((index) => !model.rows[index].actionable)) return;
     replaceTurnGroups(model, turn, [{ id: `turn:${turn.index}:all`, rowIndexes: turn.rowIndexes.slice(), action }]);
 }
 
@@ -310,7 +311,7 @@ function toActionItems(model: ActionModel): ActionItem[] {
         return {
             ...row.source,
             index: row.index,
-            action: model.groups.get(groupId)?.action ?? row.source.action,
+            action: row.actionable ? model.groups.get(groupId)?.action ?? row.source.action : "pick",
             groupId,
         };
     });
@@ -327,13 +328,17 @@ class ActionList {
         private theme: Theme,
         terminalHeight: number,
         private ctx: ExtensionCommandContext,
+        private keybindings: KeybindingsManager,
+        private terminal: { rows: number },
     ) {
         this.model = makeModel(items);
         this.maxVisibleLines = Math.max(8, Math.floor(terminalHeight / 2));
         this.buildToolCallMap();
     }
 
-    invalidate() {}
+    invalidate() {
+        this.theme = this.ctx.ui.theme;
+    }
 
     private buildToolCallMap() {
         this.toolCallMap.clear();
@@ -351,6 +356,8 @@ class ActionList {
     }
 
     render(width: number): string[] {
+        this.theme = this.ctx.ui.theme;
+        this.maxVisibleLines = Math.max(1, Math.floor(this.terminal.rows / 2));
         const visible = getVisibleRows(this.model);
         if (visible.length === 0) return [truncateToWidth(this.theme.fg("muted", "  No entries on path"), width)];
         this.model.selectedVisibleIndex = Math.max(0, Math.min(this.model.selectedVisibleIndex, visible.length - 1));
@@ -371,7 +378,8 @@ class ActionList {
                 row.kind === "assistant-intermediate" || row.kind === "tool-result",
             );
             const prefix = this.formatGroupPrefix(view.groupPosition);
-            const content = this.getEntryDisplayText(row.entry, isSelected);
+            const content = this.getEntryDisplayText(row.entry, isSelected)
+                + (row.actionable ? "" : this.theme.fg("dim", " (preserved)"));
             let line = cursor + action + " " + this.theme.fg("dim", prefix) + content;
             if (isSelected) line = this.theme.bg("selectedBg", line);
             lines.push(truncateToWidth(line, width));
@@ -460,7 +468,7 @@ class ActionList {
     }
 
     handleInput(data: string) {
-        const kb = getKeybindings();
+        const kb = this.keybindings;
         const visibleLength = getVisibleRows(this.model).length;
         if (visibleLength === 0) return;
         if (kb.matches(data, "tui.select.up") || matchesKey(data, Key.up)) {
@@ -484,7 +492,7 @@ class ActionList {
     }
 
     private writeSummarizerMessageAndCancel(): void {
-        const message = buildSummarizerContext(toActionItems(this.model)).message;
+        const message = buildSummarizerContext(projectActionItems(this.ctx, toActionItems(this.model))).message;
         const tmpFile = path.join(os.tmpdir(), `pi-treebase-summarizer-message-${Date.now()}.xml`);
         fs.writeFileSync(tmpFile, message || "<!-- No summarize-high/summarize-low groups selected. -->\n", "utf-8");
         this.ctx.ui.notify(`Treebase summarizer message written to: ${tmpFile}`, "info");
@@ -509,6 +517,7 @@ class ActionList {
                     const toolCall = msg.toolCallId ? this.toolCallMap.get(msg.toolCallId) : undefined;
                     result = this.theme.fg("muted", toolCall ? this.formatToolCall(toolCall.name, toolCall.arguments) : `[${msg.toolName ?? "tool"}]`);
                 } else if (role === "bashExecution") result = this.theme.fg("dim", `[bash]: ${normalize(msg.command ?? "")}`);
+                else if (role === "system") result = this.theme.fg("dim", entryTitle(entry));
                 else result = this.theme.fg("dim", `[${role}]`);
                 break;
             }
@@ -539,7 +548,7 @@ class ActionList {
                 result = entry.name ? this.theme.fg("dim", `[title: ${entry.name}]`) : this.theme.fg("dim", "[title: empty]");
                 break;
             default:
-                result = this.theme.fg("dim", `[unknown]`);
+                result = this.theme.fg("dim", entryTitle(entry));
         }
         return isSelected ? this.theme.bold(result) : result;
     }
@@ -587,27 +596,30 @@ export async function showActionList(
     ctx: ExtensionCommandContext,
     initialItems: ActionItem[],
 ): Promise<ActionItem[] | null> {
-    return ctx.ui.custom((tui: any, theme: any, _kb: any, done: any) => {
+    if (ctx.mode !== "tui") {
+        ctx.ui.notify("Treebase actions require TUI mode", "error");
+        return null;
+    }
+    return ctx.ui.custom<ActionItem[] | null>((tui, theme, kb, done) => {
         const terminalHeight = tui?.terminal?.rows ?? process.stdout.rows ?? 40;
         const container = new Container();
-        const list = new ActionList(initialItems, done, theme, terminalHeight, ctx);
-        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-        container.addChild(new Text(theme.fg("accent", theme.bold("Treebase Actions")), 1, 0));
-        container.addChild(
-            new Text(
-                theme.fg(
-                    "muted",
-                    "Choose what should happen to each group. P - pick, H / L - summarize with high or low importance, D - drop",
-                ),
-                1,
-                0,
-            ),
-        );
-        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        const list = new ActionList(initialItems, done, theme, terminalHeight, ctx, kb, tui.terminal);
+        const title = new Text("", 1, 0);
+        const help = new Text("", 1, 0);
+        container.addChild(new DynamicBorder((s: string) => ctx.ui.theme.fg("accent", s)));
+        container.addChild(title);
+        container.addChild(help);
+        container.addChild(new DynamicBorder((s: string) => ctx.ui.theme.fg("accent", s)));
         container.addChild(list);
-        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        container.addChild(new DynamicBorder((s: string) => ctx.ui.theme.fg("accent", s)));
         return {
-            render: (w: number) => container.render(w),
+            render: (w: number) => {
+                const activeTheme = ctx.ui.theme;
+                title.setText(activeTheme.fg("accent", activeTheme.bold("Treebase Actions")));
+                help.setText(activeTheme.fg("muted",
+                    "P - pick, H / L - summarize, D - drop. Structural and inactive history rows are preserved."));
+                return container.render(Math.max(3, w)).map(line => truncateToWidth(line, w));
+            },
             invalidate: () => container.invalidate(),
             handleInput: (data: string) => {
                 list.handleInput(data);

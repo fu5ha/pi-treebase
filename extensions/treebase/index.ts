@@ -1,296 +1,139 @@
-import type {
-    ExtensionAPI,
-    ExtensionCommandContext,
-    SessionEntry,
+import {
     SessionManager,
+    type ExtensionAPI,
+    type ExtensionCommandContext,
+    type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { showActionList } from "./action-list.js";
-import { buildRewrite, RewritePart, type BuildRewriteResult } from "./summarize.js";
+import { buildRewrite, type RewritePart, type BuildRewriteResult } from "./summarize.js";
 import { showTreeSelector } from "./tree-selector.js";
-import {
-    entriesBetweenAncestorAndLeaf,
-    isAncestor,
-    makeActionItems,
-    parentOf,
-} from "./tree-utils.js";
-import { ToolCall } from "@earendil-works/pi-ai";
+import { entriesBetweenAncestorAndLeaf, isAncestor, makeActionItems, parentOf } from "./tree-utils.js";
+import { BranchWriter, writableManager } from "./session-writer.js";
 
-function freshId(sm: SessionManager): string {
-    for (let i = 0; i < 100; i++) {
-        const id = randomUUID().slice(0, 8);
-        if (!sm.getEntry(id)) return id;
+function retainedToolUse(part: Extract<RewritePart, { kind: "retained-tool-use" }>): SessionEntry[] {
+    const callEntry = structuredClone(part.toolCallItem.entry);
+    const resultEntry = structuredClone(part.toolResultItem.entry);
+    if (callEntry.type !== "message" || callEntry.message.role !== "assistant" ||
+        resultEntry.type !== "message" || resultEntry.message.role !== "toolResult") {
+        throw new Error("Invalid retained tool-use pair");
     }
-    return randomUUID();
+    const block = callEntry.message.content.find(
+        (block) => block.type === "toolCall" && block.id === part.toolCallId,
+    );
+    if (!block || block.type !== "toolCall") throw new Error("Retained tool call not found");
+    // Keep provider item-id suffix and opaque namespace/signature metadata.
+    const suffix = part.toolCallId.includes("|") ? part.toolCallId.slice(part.toolCallId.indexOf("|")) : "";
+    const id = `call_${randomUUID()}${suffix}`;
+    callEntry.message.content = [{ ...block, id }];
+    resultEntry.message.toolCallId = id;
+    return [callEntry, resultEntry];
 }
 
-function appendClonedEntry(
-    sm: SessionManager,
-    original: SessionEntry,
-): string | null {
-    switch (original.type) {
-        case "message":
-            return sm.appendMessage(
-                structuredClone(original.message) as Parameters<
-                    SessionManager["appendMessage"]
-                >[0],
-            );
-        case "custom_message":
-            return sm.appendCustomMessageEntry(
-                original.customType,
-                structuredClone(original.content),
-                original.display,
-                structuredClone(original.details),
-            );
-        case "model_change":
-            return sm.appendModelChange(original.provider, original.modelId);
-        case "thinking_level_change":
-            return sm.appendThinkingLevelChange(original.thinkingLevel);
-        case "branch_summary": {
-            // No public appendBranchSummary API exists. Hack through the private
-            // SessionManager method so picked branch summaries remain in context.
-            // Keep original fromId as provenance metadata even though it may point
-            // at the pre-treebase history.
-            const entry = {
-                type: "branch_summary",
-                id: freshId(sm),
-                parentId: sm.getLeafId(),
-                timestamp: new Date().toISOString(),
-                fromId: original.fromId,
-                summary: original.summary,
-                details: structuredClone(original.details),
-                fromHook: original.fromHook,
-            };
-            (sm as unknown as { _appendEntry(entry: unknown): void })._appendEntry(entry);
-            return entry.id;
-        }
-        default:
-            return null;
-    }
-}
-
-function makeRetainedToolUseEntries(part: Extract<RewritePart, { kind: "retained-tool-use" }>): { toolCallEntry: SessionEntry; toolResultEntry: SessionEntry } | null {
-    if (part.toolCallItem.entry.type !== "message") return null;
-    if (part.toolResultItem.entry.type !== "message") return null;
-
-    const toolCallMessage = structuredClone(part.toolCallItem.entry.message);
-    if (toolCallMessage.role !== "assistant" || !Array.isArray(toolCallMessage.content)) return null;
-    const toolCallBlock = toolCallMessage.content.find(
-        (block) => block?.type === "toolCall" && block.id === part.toolCallId,
-    ) as ToolCall | undefined;
-    if (!toolCallBlock) return null;
-
-    const [_callId, itemId] = part.toolCallId.split("|");
-    const newToolCallId = `call_${randomUUID()}|${itemId}`;
-    toolCallMessage.content = [{ ...structuredClone(toolCallBlock), id: newToolCallId }];
-
-    const toolResultMessage = structuredClone(part.toolResultItem.entry.message) as any;
-    if (toolResultMessage.role !== "toolResult") return null;
-    toolResultMessage.toolCallId = newToolCallId;
-
-    return {
-        toolCallEntry: { ...structuredClone(part.toolCallItem.entry), message: toolCallMessage } as SessionEntry,
-        toolResultEntry: { ...structuredClone(part.toolResultItem.entry), message: toolResultMessage } as SessionEntry,
-    };
-}
-
-function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
-    const sections: string[] = [];
-    if (readFiles.length > 0) {
-        sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
-    }
-    if (modifiedFiles.length > 0) {
-        sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
-    }
-    return sections.length > 0 ? `\n\n${sections.join("\n\n")}` : "";
-}
-
-function appendSummary(
-    sm: SessionManager,
-    summary: string,
-    sourceIds: string[],
-    readFiles: string[],
-    modifiedFiles: string[],
-): string {
-    const summaryWithFileOps = summary + formatFileOperations(readFiles, modifiedFiles);
-    const entry = {
-        type: "branch_summary",
-        id: freshId(sm),
-        parentId: sm.getLeafId(),
-        timestamp: new Date().toISOString(),
-        fromId: sourceIds.at(-1) ?? sm.getLeafId() ?? "treebase",
-        summary: summaryWithFileOps,
-        details: { sourceIds, readFiles, modifiedFiles, generatedBy: "treebase" },
-        // Mark as not extension-generated so native branch summarization's
-        // prepareBranchEntries() aggregates details.readFiles/modifiedFiles.
-        fromHook: false,
-    };
-    // No public appendBranchSummary API exists. Hack through the private
-    // SessionManager method. This is better than a custom message for now, maybe there should
-    // be a customSummary type or something.
-    (sm as unknown as { _appendEntry(entry: unknown): void })._appendEntry(entry);
-    return entry.id;
-}
-
-async function applyRewrite(
-    ctx: ExtensionCommandContext,
-    targetId: string,
-    rewrite: BuildRewriteResult | null,
-): Promise<string | null> {
-    if (!rewrite) return null;
-    const { parts } = rewrite;
-    // const-cast :flushed: is this bad?
-    const sm = ctx.sessionManager as SessionManager;
-
+function writeParts(sm: SessionManager, targetId: string, rewrite: BuildRewriteResult): string | null {
     const parentId = parentOf(sm, targetId);
     if (parentId) sm.branch(parentId);
     else sm.resetLeaf();
-
-    let appended = 0;
-    for (const part of parts) {
-        if (part.kind === "pick") {
-            if (appendClonedEntry(sm, part.item.entry)) appended++;
-        } else if (part.kind === "retained-tool-use") {
-            const entries = makeRetainedToolUseEntries(part);
-            if (entries) {
-                if (appendClonedEntry(sm, entries.toolCallEntry)) appended++;
-                if (appendClonedEntry(sm, entries.toolResultEntry)) appended++;
+    const writer = new BranchWriter(sm);
+    const retainedPairs = new Map<string, SessionEntry[]>();
+    for (const part of rewrite.parts) {
+        if (part.kind === "pick") writer.append(part.item.entry);
+        else if (part.kind === "retained-tool-use") {
+            let pair = retainedPairs.get(part.toolCallId);
+            if (!pair) {
+                pair = retainedToolUse(part);
+                retainedPairs.set(part.toolCallId, pair);
             }
+            writer.append(pair[part.position === "call" ? 0 : 1]);
         } else if (part.text.trim()) {
-            appendSummary(
-                sm,
-                part.text.trim(),
-                part.sourceIds,
-                part.readFiles,
-                part.modifiedFiles,
-            );
-            appended++;
+            const fileOps = [
+                part.readFiles.length ? `<read-files>\n${part.readFiles.join("\n")}\n</read-files>` : "",
+                part.modifiedFiles.length ? `<modified-files>\n${part.modifiedFiles.join("\n")}\n</modified-files>` : "",
+            ].filter(Boolean).join("\n\n");
+            sm.branchWithSummary(sm.getLeafId(), part.text.trim() + (fileOps ? `\n\n${fileOps}` : ""), {
+                sourceIds: part.sourceIds,
+                readFiles: part.readFiles,
+                modifiedFiles: part.modifiedFiles,
+                generatedBy: "treebase",
+            }, true);
         }
     }
-    if (appended === 0) {
-        ctx.ui.notify(
-            "Treebase produced no entries; moved to target parent.",
-            "warning",
-        );
+    if (rewrite.usage && rewrite.usageProvider && rewrite.usageModel) {
+        sm.appendUsage("treebase_summary", rewrite.usageProvider, rewrite.usageModel, rewrite.usage);
     }
-
     return sm.getLeafId();
 }
 
-function isEditableNavigationTarget(entry: SessionEntry | undefined): boolean {
-    if (!entry) return false;
-    if (entry.type === "custom_message") return true;
-    return entry.type === "message" && entry.message.role === "user";
-}
-
-async function navigateToRewrittenLeaf(
-    sm: SessionManager,
-    ctx: ExtensionCommandContext,
-    rewrittenLeafId: string,
-) {
-    const rewrittenLeaf = sm.getEntry(rewrittenLeafId);
-
-    if (isEditableNavigationTarget(rewrittenLeaf)) {
-        const draftParentId = sm.getLeafId();
-        if (!draftParentId) throw new Error("failed to get leaf id");
-        const draftId = sm.appendMessage({
-            role: "user",
-            content: "",
-            timestamp: Date.now(),
-        });
-        // Selecting a user message in native /tree restores that message into
-        // the editor and leaves the session leaf at its parent. Since
-        // appendMessage advances the leaf to the draft, rewind before calling
-        // ctx.navigateTree so the target is not a no-op.
-        sm.branch(draftParentId);
-        const result = await ctx.navigateTree(draftId, { summarize: false });
-        if (result.cancelled) throw new Error("navigateTree cancelled unexpectedly");
-        return;
+async function applyRewrite(ctx: ExtensionCommandContext, targetId: string, rewrite: BuildRewriteResult) {
+    const sm = writableManager(ctx);
+    const originalLeaf = sm.getLeafId();
+    // Exercise every public copy operation on a detached manager before changing
+    // the live leaf. This catches unsupported roles, references and checkpoints.
+    const header = sm.getHeader();
+    const preview = SessionManager.inMemory(sm.getCwd(), undefined,
+        [...(header ? [structuredClone(header)] : []), ...structuredClone(sm.getEntries())]);
+    writeParts(preview, targetId, rewrite);
+    try {
+        const leaf = writeParts(sm, targetId, rewrite);
+        // Native tree navigation refreshes finalized context and tool state.
+        // User/custom targets otherwise restore a draft at their parent. A
+        // state-only anchor activates any leaf, including null, without drafts.
+        const anchor = sm.appendCustomEntry("treebase.activation", { leafId: leaf });
+        if (originalLeaf) sm.branch(originalLeaf);
+        else sm.resetLeaf();
+        const result = await ctx.navigateTree(anchor, { summarize: false });
+        if (result.cancelled) throw new Error("Treebase activation cancelled");
+    } catch (error) {
+        if (originalLeaf) sm.branch(originalLeaf);
+        else sm.resetLeaf();
+        throw error;
     }
-
-    const parentId = rewrittenLeaf?.parentId ?? null;
-    if (parentId) sm.branch(parentId);
-    else sm.resetLeaf();
-
-    const result = await ctx.navigateTree(rewrittenLeafId, { summarize: false });
-    if (result.cancelled) throw new Error("navigateTree cancelled unexpectedly");
 }
 
 export default function (pi: ExtensionAPI) {
     pi.registerCommand("treebase", {
-        description:
-            "Interactively rewrite the path back to an earlier tree node",
+        description: "Interactively rewrite the path back to an earlier tree node",
         handler: async (_args, ctx) => {
-            if (!ctx.hasUI) {
-                ctx.ui.notify("/treebase requires interactive mode", "error");
+            if (ctx.mode !== "tui") {
+                ctx.ui.notify("/treebase requires TUI mode", "error");
                 return;
             }
             await ctx.waitForIdle();
-
-            const sm = ctx.sessionManager as SessionManager;
+            const sm = writableManager(ctx);
             const currentLeafId = sm.getLeafId();
             if (!currentLeafId) {
                 ctx.ui.notify("No current session leaf", "error");
                 return;
             }
-
             const targetId = await showTreeSelector(ctx, pi);
             if (!targetId || targetId === currentLeafId) return;
-
             if (!isAncestor(sm, targetId, currentLeafId)) {
-                await ctx.navigateTree(targetId, {
-                    summarize: false,
-                });
-                ctx.ui.notify(
-                    "Selected node is not chronologically behind the current leaf; teleported without rewriting.",
-                    "info",
-                );
+                await ctx.navigateTree(targetId, { summarize: false });
+                ctx.ui.notify("Selected node is not an ancestor; navigated without rewriting.", "info");
                 return;
             }
-
-            const segment = entriesBetweenAncestorAndLeaf(
-                sm,
-                targetId,
-                currentLeafId,
-            );
-            const actionItems = makeActionItems(segment);
-            if (segment.length === 0 || actionItems.length === 0) {
-                ctx.ui.notify("Could not compute treebase path with any context-bearing entries", "error");
+            const segment = entriesBetweenAncestorAndLeaf(sm, targetId, currentLeafId);
+            const items = makeActionItems(segment, sm.buildSessionProjection());
+            if (!items.length) {
+                ctx.ui.notify("Could not compute treebase path", "error");
                 return;
             }
-
-            const edited = await showActionList(ctx, actionItems);
+            const edited = await showActionList(ctx, items);
             if (!edited) return;
-
             try {
                 const rewrite = await buildRewrite(ctx, edited);
                 if (!rewrite) {
                     ctx.ui.notify("Treebase cancelled", "info");
                     return;
                 }
-                const rewrittenLeafId = await applyRewrite(ctx, targetId, rewrite);
-                if (!rewrittenLeafId) return;
-
-                await navigateToRewrittenLeaf(sm, ctx, rewrittenLeafId);
-                const debugPaths = [
-                    rewrite.debugFiles.summarizerMessagePath
-                        ? `summarizer message: ${rewrite.debugFiles.summarizerMessagePath}`
-                        : undefined,
-                    rewrite.debugFiles.summarizerResponsePath
-                        ? `summarizer response: ${rewrite.debugFiles.summarizerResponsePath}`
-                        : undefined,
+                await applyRewrite(ctx, targetId, rewrite);
+                const paths = [
+                    rewrite.debugFiles.summarizerMessagePath,
+                    rewrite.debugFiles.summarizerResponsePath,
                 ].filter(Boolean);
-                ctx.ui.notify(
-                    debugPaths.length > 0
-                        ? `Treebase branch created\n${debugPaths.join("\n")}`
-                        : "Treebase branch created",
-                    "info",
-                );
-            } catch (err: unknown) {
-                ctx.ui.notify(
-                    `Treebase failed: ${err instanceof Error ? err.message : String(err)}`,
-                    "error",
-                );
+                ctx.ui.notify(`Treebase branch created${paths.length ? `\n${paths.join("\n")}` : ""}`, "info");
+            } catch (error) {
+                ctx.ui.notify(`Treebase failed: ${error instanceof Error ? error.message : String(error)}`, "error");
             }
         },
     });
