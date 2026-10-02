@@ -65,3 +65,28 @@ test("only successful completed editing activates; revisiting a working branch c
         await rm(work.directory, { recursive: true, force: true });
     }
 });
+
+test("cancelled operations stay cancelled when their earlier working leaf is revisited", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    const source = sm.appendMessage({ role: "user", content: "original", timestamp: 1 });
+    const anchor = sm.appendCustomEntry("treebase.working", {});
+    const workingLeaf = sm.appendCustomEntry("treebase.operation", {
+        operationId: "cancel-test", sessionId: sm.getSessionId(), originalLeaf: source,
+        workingAnchor: anchor, status: "editing", repairs: 0, directory: "unused",
+    });
+    const commands = new Map(), notices = [];
+    extension({ on: () => {}, registerCommand: (name, command) => commands.set(name, command) });
+    const ctx = {
+        mode: "tui", sessionManager: sm, waitForIdle: async () => {},
+        ui: { notify: message => notices.push(message) },
+        navigateTree: async target => { sm.branch(target); return { cancelled: false }; },
+    };
+    await commands.get("pi-treebase").handler("cancel", ctx);
+    assert.match(notices.at(-1), /cancelled/);
+    assert.equal(sm.buildSessionProjection().messages[0].content, "original");
+    sm.branch(workingLeaf);
+    const count = sm.getEntries().length;
+    await commands.get("pi-treebase").handler("resume", ctx);
+    assert.match(notices.at(-1), /No active treebase operation/);
+    assert.equal(sm.getEntries().length, count);
+});

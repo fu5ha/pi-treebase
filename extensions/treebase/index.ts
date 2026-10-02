@@ -29,12 +29,12 @@ function operation(ctx: ExtensionContext): Operation | undefined {
         if (entry.type === "custom" && entry.customType === STATE) {
             const op = entry.data as Operation;
             // A user can revisit the abandoned working branch after activation.
-            // A session-wide commit receipt prevents applying that operation twice.
-            const committed = ctx.sessionManager.getEntries().find((candidate) =>
+            // Session-wide terminal receipts prevent duplicate or cancelled reuse.
+            const terminal = ctx.sessionManager.getEntries().find((candidate) =>
                 candidate.type === "custom" && candidate.customType === STATE &&
                 (candidate.data as Operation)?.operationId === op.operationId &&
-                (candidate.data as Operation)?.status === "committed");
-            return committed?.type === "custom" ? committed.data as Operation : op;
+                ["committed", "cancelled"].includes((candidate.data as Operation)?.status));
+            return terminal?.type === "custom" ? terminal.data as Operation : op;
         }
     }
 }
@@ -155,6 +155,7 @@ export default function (pi: ExtensionAPI) {
                 if (!op || ["committed", "cancelled"].includes(op.status)) throw new Error("No active treebase operation on this branch");
                 assertWorking(ctx, op);
                 if (subcommand === "cancel") {
+                    settled.delete(op.operationId);
                     sm.appendCustomEntry(STATE, { ...op, status: "cancelled" });
                     await activate(ctx, op.originalLeaf, sm.getLeafId());
                     ctx.ui.notify(`Treebase cancelled; artifacts retained at ${op.directory}`, "info");

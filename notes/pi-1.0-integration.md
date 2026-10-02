@@ -120,10 +120,11 @@ Executed against installed pi 1.0.0:
 - `npm audit --omit=dev`: no vulnerabilities. Full development audit reports an
   upstream transitive `brace-expansion` advisory in pi's dependency tree.
 
-Phase 2 verification also ran `npm run typecheck` and four focused tests: the
+Phase 2 verification also ran `npm run typecheck` and five focused tests: the
 existing checkpoint/reload regression, aborted/unsettled readiness and duplicate
 commit handling, empty X extraction/outside invariants/P tampering, and locked
 context-edit/compaction effects plus accepted/rejected provenance insertions.
+Cancellation remains terminal even when an earlier working leaf is revisited.
 Lifecycle tests exercise the actual handlers with command/navigation doubles;
 the Phase 1 native navigation smoke remains the integration evidence.
 
