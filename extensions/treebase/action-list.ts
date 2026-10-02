@@ -296,7 +296,7 @@ function setRowActionInAssistantTurn(
 
     const finalGroupId = model.rows[turn.finalRowIndex].groupId;
     const finalGroup = finalGroupId ? model.groups.get(finalGroupId) : undefined;
-    const turnIsUnified = selectedGroupId === finalGroupId;
+    const turnIsUnified = turn.rowIndexes.every(index => model.rows[index].groupId === finalGroupId);
     const selectedIsFinal = rowIndex === turn.finalRowIndex;
 
     // Editing either side of a unified turn splits it, preserving the other

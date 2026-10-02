@@ -69,6 +69,20 @@ for (const [key, action] of [["p", "pick"], ["x", "remove"], ["m", "model"]]) {
     });
 }
 
+for (const key of ["p", "x"]) {
+    test(`final M -> ${key.toUpperCase()} -> M leaves intermediates at M`, async () => {
+        const result = await select(fixture(), [key, "m"]);
+        assert.deepEqual(result.map(item => item.action), ["model", "model", "model", "model"]);
+        const repeated = await select(fixture(), [key, "m", key, "m"]);
+        assert.deepEqual(repeated.map(item => item.action), ["model", "model", "model", "model"]);
+    });
+}
+
+test("changing an already split final preserves a different intermediate action", async () => {
+    const result = await select(fixture(), ["\x1b[A", "x", "\x1b[B", "p", "m"]);
+    assert.deepEqual(result.map(item => item.action), ["model", "remove", "remove", "model"]);
+});
+
 test("intermediate edits stay grouped, preserve the final, and rejoin matching actions", async () => {
     const split = await select(fixture({ textEnvelope: true }), ["\x1b[A", "x"]);
     assert.deepEqual(split.map(item => item.action), ["model", "remove", "remove", "model"]);
