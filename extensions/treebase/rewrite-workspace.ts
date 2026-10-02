@@ -8,7 +8,7 @@ import { actionDependencyErrors, makeActionItems, type ActionItem } from "./tree
 
 type Choice = { id: string; action: "pick" | "model" | "remove"; protected: boolean; hash: string; projected: boolean };
 export type RewriteManifest = {
-    version: 1;
+    version: 1 | 2;
     operationId: string;
     sessionId: string;
     originalLeaf: string;
@@ -171,11 +171,12 @@ export async function prepareWorkspace(sm: SessionManager, items: ActionItem[]):
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-treebase-"));
     const visible = new Set(sm.buildSessionProjection().entries.filter(e => e.messages.length).map(e => e.sourceEntry.id));
     const manifest: RewriteManifest = {
-        version: 1, operationId: randomUUID(), sessionId: sm.getSessionId(), originalLeaf: leaf,
+        version: 2, operationId: randomUUID(), sessionId: sm.getSessionId(), originalLeaf: leaf,
         selectedParent: items[0].entry.parentId, selectedIds: items.map(i => i.id),
         originalHash: hash(original), originalEstimatedTokens: estimated(sm),
         choices: items.map((item, i) => ({ id: item.id, action: item.action, protected: !!canonicalItems[i].protected,
-            hash: hash(canonical(item.entry)), projected: visible.has(item.id) })),
+            hash: hash(canonical(item.entry)), projected: visible.has(item.id) }))
+            .filter(choice => choice.action !== "model"),
     };
     const manifestText = JSON.stringify(manifest, null, 2) + "\n";
     const workspace = { ...paths(directory), manifest, manifestHash: hash(manifestText) };
@@ -193,7 +194,9 @@ export async function loadWorkspace(directory: string, expectedManifestHash: str
     const text = await fs.readFile(files.choicesPath, "utf8");
     if (hash(text) !== expectedManifestHash) fail("choices.json changed; restore the immutable manifest before continuing");
     const manifest = JSON.parse(text) as RewriteManifest;
-    if (manifest.version !== 1 || !Array.isArray(manifest.choices)) fail("Unsupported rewrite manifest");
+    if (![1, 2].includes(manifest.version) || !Array.isArray(manifest.choices)) fail("Unsupported rewrite manifest");
+    if (manifest.version === 2 && manifest.choices.some(c => !["pick", "remove"].includes(c.action)))
+        fail("Version 2 choices must contain only P/X overrides");
     return { ...files, manifest, manifestHash: expectedManifestHash };
 }
 
@@ -209,13 +212,24 @@ export async function validateWorkspace(sm: SessionManager, workspace: RewriteWo
     if (!equal(original.header, edited.header)) fail("Session header is protected");
     const originalById = new Map(original.entries.map(e => [e.id, e]));
     const selected = new Set(manifest.selectedIds);
-    const choices = new Map(manifest.choices.map(c => [c.id, c]));
+    const explicitChoices = new Map(manifest.choices.map(c => [c.id, c]));
+    // Version 2 stores only P/X overrides. The immutable snapshot supplies
+    // payload integrity for implied M records; selectedIds still defines order.
+    const choices = new Map(manifest.selectedIds.map(id => {
+        const before = originalById.get(id);
+        if (!before) fail(`Selected record ${id} missing from original snapshot`);
+        if (manifest.version === 1 && !explicitChoices.has(id)) fail(`Missing legacy choice for ${id}`);
+        const choice: Choice = explicitChoices.get(id) ?? {
+            id, action: "model", protected: false, hash: hash(canonical(before)), projected: true,
+        };
+        return [id, choice] as const;
+    }));
     const outside = original.entries.filter(e => !selected.has(e.id));
     if (!equal(outside, edited.entries.filter(e => originalById.has(e.id) && !selected.has(e.id))))
         fail("Outside-range records changed, disappeared, or were reordered");
     const candidate = edited.entries.filter(e => selected.has(e.id) || !originalById.has(e.id));
     const byId = new Map(candidate.map(e => [e.id, e]));
-    for (const choice of manifest.choices) {
+    for (const choice of choices.values()) {
         const before = originalById.get(choice.id)!;
         const after = byId.get(choice.id);
         if (hash(canonical(before)) !== choice.hash) fail(`Snapshot choice hash mismatch for ${choice.id}`);
@@ -292,7 +306,8 @@ function insertionSlot(entry: SessionEntry, manifest: RewriteManifest, choices: 
         choices.get(id)?.action === "model" && !choices.get(id)?.protected) || !sources.includes(after))
         fail(`${entry.id}: insertion requires treebaseSources of editable M IDs and treebaseAfter among those IDs`);
     const slot = manifest.selectedIds.indexOf(after);
-    const anchorInterval = (index: number) => manifest.choices.slice(0, index + 1).filter(c => c.protected || c.action === "pick").length;
+    const anchorInterval = (index: number) => manifest.selectedIds.slice(0, index + 1)
+        .filter(id => choices.get(id)?.protected || choices.get(id)?.action === "pick").length;
     if (!sources.every(id => anchorInterval(manifest.selectedIds.indexOf(id)) === anchorInterval(slot)))
         fail(`${entry.id}: synthesized material cannot cross a P/locked anchor`);
     return slot + 0.5;
@@ -332,7 +347,9 @@ function instructions(workspace: RewriteWorkspace): string {
 
 You are the actual current agent on a temporary working branch, with your normal tools.
 Edit ONLY ${workspace.contextPath}. Never change original.jsonl or choices.json.
-Inspect choices.json, session.schema.json and the projected-source flags before editing.
+Inspect choices.json and session.schema.json before editing. In version 2, choices
+lists only P/X overrides (including locked P records); every selectedId absent
+from choices is M. Projected-source flags describe the explicit overrides only.
 This duplicate contains all session history, including unrelated branches. X is NOT
 a confidentiality boundary. Do not reintroduce X facts into synthesized replacements.
 
@@ -465,11 +482,12 @@ const choicesSchema = {
     $schema: "https://json-schema.org/draft/2020-12/schema", type: "object",
     required: ["version", "operationId", "sessionId", "originalLeaf", "selectedParent", "selectedIds", "originalHash", "choices", "originalEstimatedTokens"],
     properties: {
-        version: { const: 1 }, operationId: { type: "string" }, sessionId: { type: "string" },
+        version: { const: 2 }, operationId: { type: "string" }, sessionId: { type: "string" },
         originalLeaf: { type: "string" }, selectedParent: { type: ["string", "null"] },
         selectedIds: { type: "array", items: { type: "string" }, uniqueItems: true },
         originalHash: { type: "string" }, originalEstimatedTokens: { type: "number" },
-        choices: { type: "array", items: { type: "object", required: ["id", "action", "protected", "hash", "projected"],
-            properties: { id: { type: "string" }, action: { enum: ["pick", "model", "remove"] }, protected: { type: "boolean" }, hash: { type: "string" }, projected: { type: "boolean" } } } },
+        choices: { type: "array", description: "Only P/X overrides. Unlisted selectedIds imply M.",
+            items: { type: "object", required: ["id", "action", "protected", "hash", "projected"],
+            properties: { id: { type: "string" }, action: { enum: ["pick", "remove"] }, protected: { type: "boolean" }, hash: { type: "string" }, projected: { type: "boolean" } } } },
     },
 };

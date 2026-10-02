@@ -10,6 +10,35 @@ async function edit(workspace, change) {
     await writeFile(workspace.contextPath, change(records).map(JSON.stringify).join("\n") + "\n");
 }
 
+test("choices stores only P/X overrides; implied M is editable but metadata remains protected", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    const first = sm.appendMessage({ role: "user", content: "long ".repeat(100), timestamp: 1 });
+    const second = sm.appendMessage({ role: "user", content: "second ".repeat(100), timestamp: 2 });
+    const items = makeActionItems(sm.getBranch(), sm.buildSessionProjection());
+    const workspace = await prepareWorkspace(sm, items);
+    try {
+        const manifest = JSON.parse(await readFile(workspace.choicesPath, "utf8"));
+        assert.equal(manifest.version, 2);
+        assert.deepEqual(manifest.selectedIds, [first, second]);
+        assert.deepEqual(manifest.choices, []);
+        assert.equal((await validateWorkspace(sm, workspace)).entries.length, 2);
+        await edit(workspace, records => records.map(record => record.id === first ?
+            { ...record, message: { ...record.message, content: "short" } } : record));
+        assert.equal((await validateWorkspace(sm, workspace)).entries[0].message.content, "short");
+        await edit(workspace, records => records.filter(record => record.id !== second));
+        assert.equal((await validateWorkspace(sm, workspace)).entries.length, 1);
+        await edit(workspace, records => records.map(record => record.id === first ?
+            { ...record, message: { ...record.message, timestamp: 999 } } : record));
+        await assert.rejects(validateWorkspace(sm, workspace), /metadata and type/);
+    } finally { await rm(workspace.directory, { recursive: true, force: true }); }
+    const overrides = await prepareWorkspace(sm, items.map((item, index) =>
+        ({ ...item, action: index === 0 ? "pick" : "remove" })));
+    try {
+        assert.deepEqual(overrides.manifest.choices.map(c => [c.id, c.action]),
+            [[first, "pick"], [second, "remove"]]);
+    } finally { await rm(overrides.directory, { recursive: true, force: true }); }
+});
+
 test("all-X extraction is empty, immutable outside descendants survive, and tampered P fails", async () => {
     const sm = SessionManager.inMemory(process.cwd());
     const ancestor = sm.appendMessage({ role: "user", content: "outside", timestamp: 1 });
