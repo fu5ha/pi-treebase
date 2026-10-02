@@ -8,12 +8,12 @@ import { actionDependencyErrors, makeActionItems, type ActionItem } from "./tree
 
 type Choice = { id: string; action: "pick" | "model" | "remove"; protected: boolean; hash: string; projected: boolean };
 export type RewriteManifest = {
-    version: 1 | 2;
     operationId: string;
     sessionId: string;
     originalLeaf: string;
     selectedParent: string | null;
     selectedIds: string[];
+    branchIds: string[];
     originalHash: string;
     choices: Choice[];
     originalEstimatedTokens: number;
@@ -171,8 +171,9 @@ export async function prepareWorkspace(sm: SessionManager, items: ActionItem[]):
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-treebase-"));
     const visible = new Set(sm.buildSessionProjection().entries.filter(e => e.messages.length).map(e => e.sourceEntry.id));
     const manifest: RewriteManifest = {
-        version: 2, operationId: randomUUID(), sessionId: sm.getSessionId(), originalLeaf: leaf,
+        operationId: randomUUID(), sessionId: sm.getSessionId(), originalLeaf: leaf,
         selectedParent: items[0].entry.parentId, selectedIds: items.map(i => i.id),
+        branchIds: selected.map(e => e.id),
         originalHash: hash(original), originalEstimatedTokens: estimated(sm),
         choices: items.map((item, i) => ({ id: item.id, action: item.action, protected: !!canonicalItems[i].protected,
             hash: hash(canonical(item.entry)), projected: visible.has(item.id) }))
@@ -181,9 +182,12 @@ export async function prepareWorkspace(sm: SessionManager, items: ActionItem[]):
     const manifestText = JSON.stringify(manifest, null, 2) + "\n";
     const workspace = { ...paths(directory), manifest, manifestHash: hash(manifestText) };
     await fs.writeFile(workspace.originalPath, original, { mode: 0o400 });
-    await fs.writeFile(workspace.contextPath, original);
+    const actions = new Map(items.map(item => [item.id, item.action]));
+    const editable = selected.filter(entry => actions.get(entry.id) !== "remove").map(entry =>
+        actions.get(entry.id) === "model" ? exportSource(entry) : { source: entry.id });
+    await fs.writeFile(workspace.contextPath, editable.map(record => JSON.stringify(record)).join("\n") + "\n");
     await fs.writeFile(workspace.choicesPath, manifestText);
-    await fs.writeFile(path.join(directory, "session.schema.json"), JSON.stringify(sessionSchema, null, 2));
+    await fs.writeFile(path.join(directory, "context.schema.json"), JSON.stringify(contextSchema, null, 2));
     await fs.writeFile(path.join(directory, "choices.schema.json"), JSON.stringify(choicesSchema, null, 2));
     await fs.writeFile(workspace.instructionsPath, instructions(workspace));
     return workspace;
@@ -194,9 +198,12 @@ export async function loadWorkspace(directory: string, expectedManifestHash: str
     const text = await fs.readFile(files.choicesPath, "utf8");
     if (hash(text) !== expectedManifestHash) fail("choices.json changed; restore the immutable manifest before continuing");
     const manifest = JSON.parse(text) as RewriteManifest;
-    if (![1, 2].includes(manifest.version) || !Array.isArray(manifest.choices)) fail("Unsupported rewrite manifest");
-    if (manifest.version === 2 && manifest.choices.some(c => !["pick", "remove"].includes(c.action)))
-        fail("Version 2 choices must contain only P/X overrides");
+    exactKeys(manifest, ["operationId", "sessionId", "originalLeaf", "selectedParent", "selectedIds",
+        "branchIds", "originalHash", "choices", "originalEstimatedTokens"]);
+    if (!Array.isArray(manifest.branchIds) || !Array.isArray(manifest.choices))
+        fail("Unsupported rewrite manifest; finish or cancel old workspaces before updating");
+    if (manifest.choices.some(c => !["pick", "remove"].includes(c.action)))
+        fail("choices must contain only P/X overrides");
     return { ...files, manifest, manifestHash: expectedManifestHash };
 }
 
@@ -208,60 +215,104 @@ export async function validateWorkspace(sm: SessionManager, workspace: RewriteWo
     const originalText = await fs.readFile(workspace.originalPath, "utf8");
     if (hash(originalText) !== manifest.originalHash) fail("original.jsonl changed; snapshot integrity check failed");
     const original = parseJsonl(originalText);
-    const edited = parseJsonl(await fs.readFile(workspace.contextPath, "utf8"));
-    if (!equal(original.header, edited.header)) fail("Session header is protected");
     const originalById = new Map(original.entries.map(e => [e.id, e]));
-    const selected = new Set(manifest.selectedIds);
-    const explicitChoices = new Map(manifest.choices.map(c => [c.id, c]));
-    // Version 2 stores only P/X overrides. The immutable snapshot supplies
-    // payload integrity for implied M records; selectedIds still defines order.
-    const choices = new Map(manifest.selectedIds.map(id => {
-        const before = originalById.get(id);
-        if (!before) fail(`Selected record ${id} missing from original snapshot`);
-        if (manifest.version === 1 && !explicitChoices.has(id)) fail(`Missing legacy choice for ${id}`);
-        const choice: Choice = explicitChoices.get(id) ?? {
-            id, action: "model", protected: false, hash: hash(canonical(before)), projected: true,
-        };
+    const branch: SessionEntry[] = [];
+    let cursor: string | null = manifest.originalLeaf;
+    const seenBranch = new Set<string>();
+    while (cursor !== null) {
+        if (seenBranch.has(cursor)) fail("Snapshot branch contains a cycle");
+        seenBranch.add(cursor);
+        const entry = originalById.get(cursor);
+        if (!entry) fail("Snapshot branch is disconnected");
+        branch.unshift(entry); cursor = entry.parentId;
+    }
+    if (!equal(branch.map(e => e.id), manifest.branchIds)) fail("Manifest branch does not match snapshot");
+    const start = branch.findIndex(e => e.id === manifest.selectedIds[0]);
+    if (start < 0 || !equal(branch.slice(start).map(e => e.id), manifest.selectedIds) ||
+        branch[start].parentId !== manifest.selectedParent) fail("Manifest selection does not match snapshot");
+    const snapshot = SessionManager.inMemory(sm.getCwd(), undefined, [original.header, ...original.entries]);
+    snapshot.branch(manifest.originalLeaf);
+    const canonicalItems = makeActionItems(branch.slice(start), snapshot.buildSessionProjection());
+    const explicit = new Map(manifest.choices.map(c => [c.id, c]));
+    if (explicit.size !== manifest.choices.length || manifest.choices.some(c => !manifest.selectedIds.includes(c.id)))
+        fail("Invalid choice IDs");
+    const choices = new Map(manifest.selectedIds.map((id, i) => {
+        const before = originalById.get(id)!;
+        const choice = explicit.get(id) ?? { id, action: "model" as const, protected: false,
+            hash: hash(canonical(before)), projected: true };
+        if (choice.hash !== hash(canonical(before))) fail(`Snapshot choice hash mismatch for ${id}`);
+        if (canonicalItems[i].protected && (!choice.protected || choice.action !== "pick"))
+            fail(`Locked source ${id} must be preserved`);
         return [id, choice] as const;
     }));
-    const outside = original.entries.filter(e => !selected.has(e.id));
-    if (!equal(outside, edited.entries.filter(e => originalById.has(e.id) && !selected.has(e.id))))
-        fail("Outside-range records changed, disappeared, or were reordered");
-    const candidate = edited.entries.filter(e => selected.has(e.id) || !originalById.has(e.id));
-    const byId = new Map(candidate.map(e => [e.id, e]));
-    for (const choice of choices.values()) {
-        const before = originalById.get(choice.id)!;
-        const after = byId.get(choice.id);
-        if (hash(canonical(before)) !== choice.hash) fail(`Snapshot choice hash mismatch for ${choice.id}`);
-        if (choice.action === "remove" && after) fail(`X record ${choice.id} must be omitted`);
-        if (choice.protected || choice.action === "pick") {
-            if (!after || !equal(payload(before), payload(after))) fail(`P/locked payload ${choice.id} changed or disappeared`);
-        } else if (after) validateModelEdit(before, after);
-    }
-    // Walk only the rewrite chain. Unrelated original descendants may still point
-    // to deleted selected IDs in this editing artifact; they are never imported.
-    const children = new Map<string | null, SessionEntry[]>();
-    for (const entry of candidate) {
-        const list = children.get(entry.parentId) ?? [];
-        list.push(entry); children.set(entry.parentId, list);
-    }
+    const records = parseEditingJsonl(await fs.readFile(workspace.contextPath, "utf8"));
+    const prefix = branch.slice(0, start);
+    for (let i = 0; i < prefix.length; i++)
+        if (!equal(records[i], { source: prefix[i].id })) fail("Read-only branch prefix changed or disappeared");
+    const selectedRecords = records.slice(prefix.length);
     const ordered: SessionEntry[] = [];
-    let parent = manifest.selectedParent;
-    const visited = new Set<string>();
-    while (children.has(parent)) {
-        const next = children.get(parent)!;
-        if (next.length !== 1) fail(`Rewrite chain branches at ${parent ?? "root"}; update parentId links`);
-        const entry = next[0];
-        if (visited.has(entry.id)) fail("Rewrite chain contains a cycle");
-        ordered.push(entry); visited.add(entry.id); parent = entry.id;
+    const used = new Set<string>();
+    const anchors = manifest.selectedIds.filter(id => choices.get(id)!.action === "pick");
+    const interval = (id: string) => {
+        const index = manifest.selectedIds.indexOf(id);
+        return manifest.selectedIds.slice(0, index).filter(source => choices.get(source)!.action === "pick").length;
+    };
+    let currentInterval = 0;
+    const excerpts: { callSource: string; resultSource: string }[] = [];
+    for (const record of selectedRecords) {
+        let entry: SessionEntry;
+        let source: string | undefined;
+        if (record.kind === "context") {
+            exactKeys(record, ["kind", "sources", "content"]);
+            if (!Array.isArray(record.sources) || !record.sources.length ||
+                new Set(record.sources).size !== record.sources.length ||
+                !record.sources.every((id: unknown) => typeof id === "string" &&
+                    choices.get(id)?.action === "model" && !choices.get(id)?.protected && interval(id) === currentInterval))
+                fail("Synthesized context requires editable M sources in its current anchor interval");
+            validateContent(record.content);
+            entry = { type: "custom_message", id: randomUUID(), parentId: null, timestamp: new Date().toISOString(),
+                customType: "treebase.context", display: true, content: record.content,
+                details: { treebaseSources: record.sources } } as SessionEntry;
+        } else {
+            source = record.kind === "tool-excerpt" ? record.resultSource : record.source;
+            if (typeof source !== "string" || !choices.has(source)) fail("Unknown or outside-range source");
+            if (used.has(source)) fail(`Duplicate source ${source}`);
+            used.add(source);
+            const choice = choices.get(source)!;
+            const before = originalById.get(source)!;
+            if (choice.action === "remove") fail(`X source ${source} must be omitted`);
+            if (choice.action === "pick") {
+                if (!equal(record, { source }) || anchors[currentInterval] !== source)
+                    fail(`P/locked source ${source} changed, disappeared, or crossed an anchor`);
+                currentInterval++;
+                entry = structuredClone(before);
+            } else {
+                if (interval(source) !== currentInterval) fail(`M source ${source} crossed a P/locked anchor`);
+                if (record.kind === "tool-excerpt") {
+                    entry = extractToolExcerpt(record, before, originalById, choices, new Set(manifest.branchIds));
+                    excerpts.push({ callSource: record.callSource, resultSource: source });
+                } else {
+                    const field = editableField(before);
+                    exactKeys(record, ["source", ...(field ? [field] : [])]);
+                    entry = structuredClone(before);
+                    if (field && field in record) {
+                        if (entry.type === "message") (entry.message as any)[field] = record[field];
+                        else (entry as any)[field] = record[field];
+                    }
+                    validateShape(entry);
+                    validateModelEdit(before, entry);
+                }
+            }
+        }
+        entry.parentId = ordered.at(-1)?.id ?? manifest.selectedParent;
+        ordered.push(entry);
     }
-    if (ordered.length !== candidate.length) fail("Rewrite records are disconnected from selectedParent; update parentId links");
-    let previousSlot = -1;
-    for (const entry of ordered) {
-        let slot = manifest.selectedIds.indexOf(entry.id);
-        if (slot < 0) slot = insertionSlot(entry, manifest, choices);
-        if (slot < previousSlot) fail(`Record ${entry.id} crossed an ordered original/P anchor`);
-        previousSlot = slot;
+    if (currentInterval !== anchors.length) fail("P/locked source disappeared");
+    for (const excerpt of excerpts) {
+        const call = [...prefix, ...ordered].find(e => e.id === excerpt.callSource);
+        const before = originalById.get(excerpt.callSource)!;
+        if (!call || !equal(payload(call), payload(before)))
+            fail(`Tool excerpt ${excerpt.resultSource} requires its full unchanged assistant call envelope`);
     }
     const preview = SessionManager.inMemory(sm.getCwd(), undefined, [original.header, ...original.entries]);
     if (manifest.selectedParent) preview.branch(manifest.selectedParent); else preview.resetLeaf();
@@ -276,6 +327,93 @@ export async function validateWorkspace(sm: SessionManager, workspace: RewriteWo
     if (estimatedTokens > manifest.originalEstimatedTokens)
         fail(`Effective context grew from approximately ${manifest.originalEstimatedTokens} to ${estimatedTokens} tokens; shrink M material`);
     return { entries: ordered, estimatedTokens, originalEstimatedTokens: manifest.originalEstimatedTokens };
+}
+
+function exactKeys(record: Record<string, any>, allowed: string[]) {
+    if (Object.keys(record).some(key => !allowed.includes(key))) fail("Unexpected editing-record field");
+}
+
+function editableField(entry: SessionEntry): "content" | "output" | "summary" | undefined {
+    if (entry.type === "message") return entry.message.role === "bashExecution" ? "output" : "content";
+    if (entry.type === "custom_message") return "content";
+    if (entry.type === "branch_summary") return "summary";
+    return undefined;
+}
+
+function exportSource(entry: SessionEntry) {
+    const field = editableField(entry);
+    return field ? { source: entry.id, [field]: entry.type === "message" ? (entry.message as any)[field] : (entry as any)[field] }
+        : { source: entry.id };
+}
+
+function parseEditingJsonl(text: string): Record<string, any>[] {
+    return text.split(/\r?\n/).filter(line => line.trim()).map((line, i) => {
+        let record: unknown;
+        try { record = JSON.parse(line); } catch { return fail(`Invalid JSON on nonblank record ${i + 1}`); }
+        if (!object(record)) fail(`Editing record ${i + 1} must be an object`);
+        return record;
+    });
+}
+
+function extractToolExcerpt(record: Record<string, any>, before: SessionEntry,
+    originalById: Map<string, SessionEntry>, choices: Map<string, Choice>, branchIds: Set<string>): SessionEntry {
+    exactKeys(record, ["kind", "callSource", "resultSource", "keep"]);
+    const call = originalById.get(record.callSource);
+    const resultMessage = before.type === "message" && before.message.role === "toolResult" ? before.message : undefined;
+    if (before.type !== "message" || before.message.role !== "toolResult" ||
+        !call || call.type !== "message" || call.message.role !== "assistant" ||
+        !branchIds.has(call.id) || choices.get(call.id)?.action === "remove" ||
+        !call.message.content.some(block => block.type === "toolCall" &&
+            block.id === resultMessage!.toolCallId && block.name === resultMessage!.toolName))
+        fail("Tool excerpt requires the original matching assistant call and result");
+    if (!Array.isArray(record.keep) || !record.keep.length) fail("Tool excerpt requires nonempty keep ranges");
+    const content = before.message.content;
+    const retained = new Map<number, { startLine: number; endLine: number }[]>();
+    let previousBlock = -1, previousEnd = 0;
+    for (const range of record.keep) {
+        if (!object(range)) fail("Invalid tool excerpt range");
+        exactKeys(range, ["block", "startLine", "endLine"]);
+        const { block, startLine, endLine } = range;
+        if (!Number.isInteger(block) || block < 0 || !Number.isInteger(startLine) || !Number.isInteger(endLine) ||
+            startLine < 1 || endLine < startLine || content[block]?.type !== "text")
+            fail("Tool excerpt ranges require existing text blocks and 1-based inclusive lines");
+        const text = (content[block] as { type: "text"; text: string }).text;
+        if (endLine > text.split("\n").length || block < previousBlock ||
+            (block === previousBlock && startLine <= previousEnd)) fail("Tool excerpt ranges must be ordered, disjoint, and in bounds");
+        const ranges = retained.get(block) ?? [];
+        ranges.push({ startLine, endLine }); retained.set(block, ranges);
+        previousBlock = block; previousEnd = endLine;
+    }
+    const result = structuredClone(before);
+    const message = (result as any).message;
+    message.content = [];
+    for (let block = 0; block < content.length; block++) {
+        const original = content[block];
+        if (original.type !== "text") {
+            // Excerpts operate on text only; images are retained rather than silently discarded.
+            message.content.push(structuredClone(original));
+            continue;
+        }
+        const lines = original.text.split("\n");
+        const ranges = retained.get(block) ?? [];
+        const parts: string[] = [];
+        let next = 1;
+        for (const range of ranges) {
+            if (range.startLine > next) parts.push(`[treebase: omitted lines ${next}-${range.startLine - 1} of block ${block}]`);
+            parts.push(lines.slice(range.startLine - 1, range.endLine).join("\n"));
+            next = range.endLine + 1;
+        }
+        if (next <= lines.length) parts.push(`[treebase: omitted lines ${next}-${lines.length} of block ${block}]`);
+        message.content.push({ type: "text", text: parts.join("\n") });
+    }
+    if (message.details !== undefined && !object(message.details))
+        fail("Tool excerpt cannot extend non-object tool-result details");
+    message.details = { ...message.details, treebaseExcerpt: { callSource: call.id, resultSource: before.id,
+        originalHash: hash(canonical(before)), keep: structuredClone(record.keep),
+        ...(message.details?.treebaseExcerpt !== undefined
+            ? { previous: structuredClone(message.details.treebaseExcerpt) } : {}) } };
+    validateShape(result);
+    return result;
 }
 
 function validateModelEdit(before: SessionEntry, after: SessionEntry) {
@@ -294,23 +432,6 @@ function validateModelEdit(before: SessionEntry, after: SessionEntry) {
         delete a.summary; delete b.summary;
     }
     if (!equal(a, b)) fail(`M record ${before.id}: only content/output/summary is editable; metadata and type must stay intact`);
-}
-
-function insertionSlot(entry: SessionEntry, manifest: RewriteManifest, choices: Map<string, Choice>): number {
-    if (!Number.isFinite(Date.parse(entry.timestamp))) fail(`${entry.id}: inserted record requires an ISO timestamp`);
-    if (entry.type !== "custom_message" || entry.customType !== "treebase.context" || entry.display !== true ||
-        !object(entry.details)) fail(`${entry.id}: insertions must be display:true custom_message records of type treebase.context`);
-    const sources = entry.details.treebaseSources;
-    const after = entry.details.treebaseAfter;
-    if (!Array.isArray(sources) || !sources.length || !sources.every(id => typeof id === "string" &&
-        choices.get(id)?.action === "model" && !choices.get(id)?.protected) || !sources.includes(after))
-        fail(`${entry.id}: insertion requires treebaseSources of editable M IDs and treebaseAfter among those IDs`);
-    const slot = manifest.selectedIds.indexOf(after);
-    const anchorInterval = (index: number) => manifest.selectedIds.slice(0, index + 1)
-        .filter(id => choices.get(id)?.protected || choices.get(id)?.action === "pick").length;
-    if (!sources.every(id => anchorInterval(manifest.selectedIds.indexOf(id)) === anchorInterval(slot)))
-        fail(`${entry.id}: synthesized material cannot cross a P/locked anchor`);
-    return slot + 0.5;
 }
 
 function validateToolPairing(messages: ReturnType<typeof convertToLlm>) {
@@ -343,151 +464,129 @@ function validateToolPairing(messages: ReturnType<typeof convertToLlm>) {
 }
 
 function instructions(workspace: RewriteWorkspace): string {
-    return `# Controlled context editing
+    return `# Ordered branch context editing
 
 You are the actual current agent on a temporary working branch, with your normal tools.
 Edit ONLY ${workspace.contextPath}. Never change original.jsonl or choices.json.
-Inspect choices.json and session.schema.json before editing. In version 2, choices
-lists only P/X overrides (including locked P records); every selectedId absent
-from choices is M. Projected-source flags describe the explicit overrides only.
-This duplicate contains all session history, including unrelated branches. X is NOT
-a confidentiality boundary. Do not reintroduce X facts into synthesized replacements.
+Read choices.json and context.schema.json. choices contains only P/X overrides;
+selectedIds absent from choices imply M. original.jsonl is the immutable full
+session snapshot; context.jsonl exports only the original current branch.
 
-Use programmatic JSONL inspection and batched edits. Preserve precise useful facts;
-prefer concise context over a prescribed summary format. No new agent/session is needed.
+Each nonblank line is one editing record. Line order determines ancestry.
+Do not write native session records, IDs, parentId, timestamps or a session header.
+The read-only prefix before selectedIds is source-only and must remain first,
+unchanged. P/locked sources must remain source-only and in their original order.
+X sources must be absent and must not be reintroduced in synthesized context.
+X is exclusion, not confidentiality: the snapshot and your current context retain it.
 
-## Durable extraction contract
+## Source entries
 
-- P and locked records must remain with their original ID, timestamp and payload.
-  Only parentId may change. Retained original entries must preserve original order.
-- X records must be deleted from this duplicate. M may be retained, removed, or have
-  content/output/summary rewritten; all other metadata and toolCall blocks stay exact.
-  Remove tool calls and matching results together, never fabricate their results.
-- The selected records are choices.json.selectedIds. Outside-range records and header
-  must remain byte-equivalent as JSON values and in their original relative order.
-  Outside descendants may still reference a deleted selected ID: this artifact is
-  extracted, not directly opened as a live session.
-- Reconnect retained selected records and new records into ONE parentId chain starting
-  at choices.json.selectedParent (possibly null). Do not rely on line numbers.
-  The final chain can be empty if no P/locked entries remain.
-- New material must be a custom_message with fresh unique ID, ISO timestamp,
-  customType:"treebase.context", display:true, string/text/image content, and
-  details: {treebaseSources:["M-source-id",...], treebaseAfter:"M-source-id"}.
-  treebaseAfter must be among the sources. Insert after that source's original slot,
-  whether that source is retained or removed. Multiple insertions at the same slot
-  are allowed. All sources must be editable M records in the same P/locked-anchor
-  interval; synthesized material cannot cross a P anchor. No new system, structural,
-  tool, assistant or user records. Existing compactions/context edits stay protected.
-- Effective context must not grow, and must fit 90% of the active model context
-  window when known, using pi's estimated model-context tokens (not file byte size).
-  Preserved checkpoints/references and tool pairing are validated before activation.
+{"source":"original-id"} keeps the full original payload.
+M entries export their original editable field: content, output or summary.
+Edit that field or remove the whole line. All other metadata is restored from the
+snapshot. Look up source-only prefix/P/locked payloads in original.jsonl when
+you need their full content or source roles/tool names; the snapshot contains
+the complete branch data and metadata.
+Assistant content includes toolCall blocks; keep them exactly.
+Keep tool calls and matching results together; never fabricate tool results.
+M sources may reorder within their interval between P/locked anchors, not across
+anchors. A source may appear at most once. Protected/inactive raw records stay
+protected, so old context-edit/compaction effects cannot accidentally revive history.
 
-## Completion and repair
+## Synthesized context
 
-When finished, write ${workspace.readyPath} containing exactly:
-{"operationId":${JSON.stringify(workspace.manifest.operationId)}}
-Then end normally with a short receipt. Do not invoke /treebase yourself.
-The extension validates after a completed run, supplies bounded repair diagnostics,
-and automatically attempts activation from a deferred idle command context.
-Interrupted/aborted runs cannot activate output. The user can cancel with
-/treebase cancel. After extension/session reload the user must use
-/treebase resume and let a fresh run complete before automatic activation.
-Instructions and editing activity stay off the final branch.
-Snapshots/artifacts are retained in ${workspace.directory} for recovery and inspection.
+{"kind":"context","sources":["M-id"],"content":"Useful facts"}
+Content may also be supported text/image blocks. Sources must be editable M IDs
+in the same current anchor interval. Sources may be removed or retained elsewhere
+in that interval. Treebase imports a display:true treebase.context custom message
+and records source provenance. Do not invent native historical tool calls or results.
+
+## Verbatim tool excerpts
+
+Replace a result's source line with:
+{"kind":"tool-excerpt","callSource":"assistant-id","resultSource":"result-id","keep":[{"block":0,"startLine":42,"endLine":57}]}
+Keep its full unchanged assistant call envelope as a separate source line. The
+excerpt does not insert the call itself. Every sibling tool call in a multi-call
+envelope still needs a result. The result must be editable M; the call may be M,
+P, or in the protected prefix.
+
+Ranges refer to original snapshot content blocks (zero-based) and text lines
+(1-based, inclusive, split on LF). They must be nonempty, sorted, disjoint and in
+bounds. Treebase extracts text directly and inserts explicit omission markers;
+do not supply replacement text. Non-text blocks are retained unchanged. Result
+metadata/error status and existing object details survive, with treebaseExcerpt
+provenance added. Non-object details cannot be excerpted. For paraphrases use
+synthesized context instead of pretending they are verbatim tool output.
+
+The native projected/converted effective context estimate must not grow and
+must fit 90% of the known model window. This is an estimate, not a provider token
+guarantee. Use programmatic inspection and batched edits; no fixed summary format.
+
+## Completion and recovery
+
+Write ${workspace.readyPath} only when editing is complete:
+{"operationId":"${workspace.manifest.operationId}","manifestHash":"${workspace.manifestHash}","ready":true}
+Readiness is validated at completed settlement; repair diagnostics may follow.
+After successful settlement treebase automatically revalidates and activates
+from an idle deferred command context. Editing activity never enters the final
+branch. /treebase resume continues an interrupted operation; /treebase cancel
+returns to original history. Reload requires a fresh resumed settled editing run.
+Supported native IDs/references are remapped by reconstruction; opaque
+extension-private references are not remapped automatically. Unsupported
+shapes, checkpoints and public append gaps fail explicitly.
+Artifacts remain for recovery. There is no protocol version or legacy reader;
+finish or cancel pending workspaces before updating the editing format.
 `;
 }
 
-const contentSchema = {
-    oneOf: [{ type: "string" }, { type: "array", items: { oneOf: [
-        { type: "object", required: ["type", "text"], properties: { type: { const: "text" }, text: { type: "string" } } },
-        { type: "object", required: ["type", "data", "mimeType"], properties: { type: { const: "image" }, data: { type: "string" }, mimeType: { type: "string" } } },
-        { type: "object", required: ["type", "thinking"], properties: { type: { const: "thinking" }, thinking: { type: "string" } } },
-        { type: "object", required: ["type", "id", "name", "arguments"], properties: { type: { const: "toolCall" }, id: { type: "string" }, name: { type: "string" }, arguments: { type: "object" } } },
-    ] } }] };
-const blocks = contentSchema.oneOf[1].items!.oneOf;
-const normalContentSchema = { oneOf: [{ type: "string" }, { type: "array", items: { oneOf: [blocks[0], blocks[1]] } }] };
-const assistantContentSchema = { type: "array", items: { oneOf: [blocks[0], blocks[2], blocks[3]] } };
-const stringSchema = { type: "string" };
-const numberSchema = { type: "number", minimum: 0 };
-const usageSchema = {
-    type: "object", required: ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"],
-    properties: {
-        input: numberSchema, output: numberSchema, cacheRead: numberSchema, cacheWrite: numberSchema, totalTokens: numberSchema,
-        cost: { type: "object", required: ["input", "output", "cacheRead", "cacheWrite", "total"],
-            properties: { input: numberSchema, output: numberSchema, cacheRead: numberSchema, cacheWrite: numberSchema, total: numberSchema } },
-    },
-};
-const messageSchema = {
-    type: "object", required: ["role", "timestamp"],
-    properties: {
-        role: { enum: ["system", "user", "assistant", "toolResult", "bashExecution", "custom"] },
-        timestamp: { type: "number" }, content: contentSchema,
-    },
-    allOf: [
-        { if: { properties: { role: { enum: ["system", "user", "assistant", "toolResult", "custom"] } } }, then: { required: ["content"] } },
-        { if: { properties: { role: { enum: ["user", "custom"] } } }, then: { properties: { content: normalContentSchema } } },
-        { if: { properties: { role: { const: "assistant" } } }, then: {
-            required: ["api", "provider", "model", "usage", "stopReason"],
-            properties: { api: stringSchema, provider: stringSchema, model: stringSchema, usage: usageSchema,
-                content: assistantContentSchema,
-                stopReason: { enum: ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"] } },
-        } },
-        { if: { properties: { role: { const: "toolResult" } } }, then: { required: ["toolCallId", "toolName", "isError"],
-            properties: { toolCallId: stringSchema, toolName: stringSchema, isError: { type: "boolean" }, usage: usageSchema,
-                content: normalContentSchema.oneOf[1] } } },
-        { if: { properties: { role: { const: "bashExecution" } } }, then: { required: ["command", "output", "cancelled", "truncated"],
-            properties: { command: stringSchema, output: stringSchema, cancelled: { type: "boolean" }, truncated: { type: "boolean" },
-                exitCode: { type: ["number", "null"] }, excludeFromContext: { type: "boolean" }, fullOutputPath: stringSchema } } },
-        { if: { properties: { role: { const: "custom" } } }, then: { required: ["customType", "display"],
-            properties: { customType: stringSchema, display: { type: "boolean" } } } },
-        { if: { properties: { role: { const: "system" } } }, then: { properties: {
-            content: { oneOf: [{ type: "string" }, { type: "array", items: blocks[0] }] },
-            sections: { type: "object", additionalProperties: { type: ["string", "null"] } },
-            toolsAdded: { type: "array", items: { type: "object", required: ["name", "description", "parameters"],
-                properties: { name: stringSchema, description: stringSchema, parameters: { type: "object" } } } },
-            toolsRemoved: { type: "array", items: { type: "object", required: ["name"], properties: { name: stringSchema } } },
-        } } },
-    ],
-};
-const entrySpecificSchemas: Record<string, { required: string[]; properties?: Record<string, unknown> }> = {
-    message: { required: ["message"], properties: { message: messageSchema } },
-    custom_message: { required: ["customType", "content", "display"], properties: { customType: stringSchema, content: normalContentSchema, display: { type: "boolean" } } },
-    thinking_level_change: { required: ["thinkingLevel"], properties: { thinkingLevel: stringSchema } },
-    model_change: { required: ["provider", "modelId"], properties: { provider: stringSchema, modelId: stringSchema } },
-    usage: { required: ["kind", "provider", "model", "usage"], properties: { kind: stringSchema, provider: stringSchema, model: stringSchema, usage: usageSchema, note: stringSchema } },
-    compaction: { required: ["summary", "firstKeptEntryId", "tokensBefore"], properties: { summary: stringSchema, firstKeptEntryId: stringSchema,
-        tokensBefore: numberSchema, systemMessage: messageSchema, fromHook: { type: "boolean" }, usage: usageSchema } },
-    branch_summary: { required: ["summary", "fromId"], properties: { summary: stringSchema, fromId: stringSchema, fromHook: { type: "boolean" }, usage: usageSchema } },
-    context_edit: { required: ["targetId", "replacement"], properties: { targetId: stringSchema,
-        replacement: { oneOf: [{ type: "null" }, { type: "object", required: ["content"], properties: { content: contentSchema }, additionalProperties: false }] } } },
-    label: { required: ["targetId"], properties: { targetId: stringSchema, label: stringSchema } },
-    session_info: { required: [], properties: { name: stringSchema } },
-    custom: { required: ["customType"], properties: { customType: stringSchema } },
-};
-const sessionSchema = {
+const textBlockSchema = { type: "object", required: ["type", "text"],
+    properties: { type: { const: "text" }, text: { type: "string" } } };
+const imageBlockSchema = { type: "object", required: ["type", "data", "mimeType"],
+    properties: { type: { const: "image" }, data: { type: "string" }, mimeType: { type: "string" } } };
+const thinkingBlockSchema = { type: "object", required: ["type", "thinking"],
+    properties: { type: { const: "thinking" }, thinking: { type: "string" } } };
+const toolCallBlockSchema = { type: "object", required: ["type", "id", "name", "arguments"],
+    properties: { type: { const: "toolCall" }, id: { type: "string" }, name: { type: "string" }, arguments: { type: "object" } } };
+const contentSchema = { oneOf: [
+    { type: "string" },
+    { type: "array", items: { oneOf: [textBlockSchema, imageBlockSchema, thinkingBlockSchema, toolCallBlockSchema] } },
+] };
+const synthesizedContentSchema = { oneOf: [
+    { type: "string" },
+    { type: "array", items: { oneOf: [textBlockSchema, imageBlockSchema] } },
+] };
+const contextSchema = {
     $schema: "https://json-schema.org/draft/2020-12/schema",
-    description: "One JSONL record. Runtime validation additionally enforces the choices, ancestry, references, replay and insertion contract.",
+    description: "One ordered editing JSONL record. Runtime validation checks snapshot sources, locks, anchor intervals, metadata and tool pairing.",
     oneOf: [
-        { type: "object", required: ["type", "id", "timestamp", "cwd"], properties: { type: { const: "session" }, id: { type: "string" }, timestamp: { type: "string" }, cwd: { type: "string" }, version: { const: 3 } } },
-        { type: "object", required: ["type", "id", "parentId", "timestamp"], properties: {
-            type: { enum: ["message", "thinking_level_change", "model_change", "usage", "compaction", "branch_summary", "custom", "label", "session_info", "custom_message", "context_edit"] },
-            id: { type: "string" }, parentId: { type: ["string", "null"] }, timestamp: { type: "string" },
-            message: messageSchema,
-            content: normalContentSchema,
-        }, allOf: Object.entries(entrySpecificSchemas).map(([type, schema]) =>
-            ({ if: { properties: { type: { const: type } } }, then: schema })) },
+        { type: "object", additionalProperties: false, required: ["source"], properties: {
+            source: { type: "string" }, content: contentSchema, output: { type: "string" }, summary: { type: "string" },
+        } },
+        { type: "object", additionalProperties: false, required: ["kind", "sources", "content"], properties: {
+            kind: { const: "context" }, sources: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string" } },
+            content: synthesizedContentSchema,
+        } },
+        { type: "object", additionalProperties: false, required: ["kind", "callSource", "resultSource", "keep"], properties: {
+            kind: { const: "tool-excerpt" }, callSource: { type: "string" }, resultSource: { type: "string" },
+            keep: { type: "array", minItems: 1, items: {
+                type: "object", additionalProperties: false, required: ["block", "startLine", "endLine"],
+                properties: { block: { type: "integer", minimum: 0 }, startLine: { type: "integer", minimum: 1 },
+                    endLine: { type: "integer", minimum: 1 } },
+            } },
+        } },
     ],
 };
 const choicesSchema = {
-    $schema: "https://json-schema.org/draft/2020-12/schema", type: "object",
-    required: ["version", "operationId", "sessionId", "originalLeaf", "selectedParent", "selectedIds", "originalHash", "choices", "originalEstimatedTokens"],
+    $schema: "https://json-schema.org/draft/2020-12/schema", type: "object", additionalProperties: false,
+    required: ["operationId", "sessionId", "originalLeaf", "selectedParent", "selectedIds", "branchIds", "originalHash", "choices", "originalEstimatedTokens"],
     properties: {
-        version: { const: 2 }, operationId: { type: "string" }, sessionId: { type: "string" },
-        originalLeaf: { type: "string" }, selectedParent: { type: ["string", "null"] },
-        selectedIds: { type: "array", items: { type: "string" }, uniqueItems: true },
-        originalHash: { type: "string" }, originalEstimatedTokens: { type: "number" },
+        operationId: { type: "string" }, sessionId: { type: "string" }, originalLeaf: { type: "string" },
+        selectedParent: { type: ["string", "null"] }, selectedIds: { type: "array", items: { type: "string" } },
+        branchIds: { type: "array", items: { type: "string" } }, originalHash: { type: "string" },
+        originalEstimatedTokens: { type: "number", minimum: 0 },
         choices: { type: "array", description: "Only P/X overrides. Unlisted selectedIds imply M.",
-            items: { type: "object", required: ["id", "action", "protected", "hash", "projected"],
-            properties: { id: { type: "string" }, action: { enum: ["pick", "remove"] }, protected: { type: "boolean" }, hash: { type: "string" }, projected: { type: "boolean" } } } },
+            items: { type: "object", additionalProperties: false, required: ["id", "action", "protected", "hash", "projected"],
+                properties: { id: { type: "string" }, action: { enum: ["pick", "remove"] },
+                    protected: { type: "boolean" }, hash: { type: "string" }, projected: { type: "boolean" } } } },
     },
 };
