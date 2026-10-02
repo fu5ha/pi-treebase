@@ -37,7 +37,10 @@ test("ordered source JSONL exports one branch, implies M, and restores metadata/
     const work = await prepareWorkspace(sm, items(sm));
     try {
         assert.equal("version" in work.manifest, false);
-        assert.deepEqual(work.manifest.choices, []);
+        assert.deepEqual(work.choices, []);
+        assert.deepEqual(JSON.parse(await readFile(work.choicesPath, "utf8")), []);
+        assert.equal("choices" in work.manifest, false);
+        assert.equal(typeof work.manifest.choicesHash, "string");
         assert.deepEqual(work.manifest.selectedIds, [first, second]);
         const exported = await read(work);
         assert.deepEqual(exported.map(e => e.source), [first, second]);
@@ -128,7 +131,36 @@ test("synthesis and reordered M stay in their P-anchor interval", async () => {
     } finally { await cleanup(work); }
 });
 
-test("workspace hashes and no-version/no-legacy contract are enforced", async () => {
+test("choices are a plain sparse P/X array with a minimal schema and separate manifest", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    const pick = sm.appendMessage({ role: "user", content: "pick", timestamp: 1 });
+    const model = sm.appendMessage({ role: "user", content: "model", timestamp: 2 });
+    const remove = sm.appendMessage({ role: "user", content: "remove", timestamp: 3 });
+    const work = await prepareWorkspace(sm, items(sm).map(e => ({
+        ...e, action: e.id === pick ? "pick" : e.id === remove ? "remove" : "model",
+    })));
+    try {
+        const expected = [{ id: pick, action: "P" }, { id: remove, action: "X" }];
+        assert.deepEqual(work.choices, expected);
+        assert.deepEqual(JSON.parse(await readFile(work.choicesPath, "utf8")), expected);
+        assert.ok(!work.choices.some(e => e.id === model));
+        const schema = JSON.parse(await readFile(join(work.directory, "choices.schema.json"), "utf8"));
+        assert.equal(schema.type, "array");
+        assert.equal(schema.items.type, "object");
+        assert.equal(schema.items.additionalProperties, false);
+        assert.deepEqual([...schema.items.required].sort(), ["action", "id"]);
+        assert.deepEqual(Object.keys(schema.items.properties).sort(), ["action", "id"]);
+        assert.deepEqual(schema.items.properties.action.enum, ["P", "X"]);
+        assert.deepEqual(JSON.parse(await readFile(work.manifestPath, "utf8")), work.manifest);
+        assert.equal("choices" in work.manifest, false);
+        assert.equal("version" in work.manifest, false);
+        const loaded = await loadWorkspace(work.directory, work.manifestHash);
+        assert.deepEqual(loaded.choices, expected);
+        assert.deepEqual(loaded.manifest, work.manifest);
+    } finally { await cleanup(work); }
+});
+
+test("workspace snapshot hashes and no-legacy contract are enforced", async () => {
     const sm = SessionManager.inMemory(process.cwd());
     sm.appendMessage({ role: "user", content: "original", timestamp: 1 });
     const work = await prepareWorkspace(sm, items(sm));
@@ -139,8 +171,28 @@ test("workspace hashes and no-version/no-legacy contract are enforced", async ()
         await chmod(work.originalPath, 0o600);
         await writeFile(work.originalPath, snapshot + "\n");
         await assert.rejects(validateWorkspace(sm, work), /snapshot integrity/);
+    } finally { await cleanup(work); }
+});
+
+test("loadWorkspace checks manifest integrity before choices integrity", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    sm.appendMessage({ role: "user", content: "original", timestamp: 1 });
+    const work = await prepareWorkspace(sm, items(sm));
+    try {
+        await writeFile(work.manifestPath, "{}");
+        await assert.rejects(loadWorkspace(work.directory, work.manifestHash), /manifest\.json changed/);
         await writeFile(work.choicesPath, "{}");
-        await assert.rejects(loadWorkspace(work.directory, work.manifestHash), /choices.json changed/);
+        await assert.rejects(loadWorkspace(work.directory, work.manifestHash), /manifest\.json changed/);
+    } finally { await cleanup(work); }
+});
+
+test("loadWorkspace checks choices integrity independently of the manifest", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    sm.appendMessage({ role: "user", content: "original", timestamp: 1 });
+    const work = await prepareWorkspace(sm, items(sm));
+    try {
+        await writeFile(work.choicesPath, "{}");
+        await assert.rejects(loadWorkspace(work.directory, work.manifestHash), /choices\.json changed/);
     } finally { await cleanup(work); }
 });
 

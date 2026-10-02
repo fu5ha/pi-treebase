@@ -6,7 +6,8 @@ import * as path from "node:path";
 import { BranchWriter } from "./session-writer.ts";
 import { actionDependencyErrors, makeActionItems, type ActionItem } from "./tree-utils.ts";
 
-type Choice = { id: string; action: "pick" | "model" | "remove"; protected: boolean; hash: string; projected: boolean };
+type Choice = { id: string; action: "pick" | "model" | "remove"; protected: boolean };
+type ChoiceOverride = { id: string; action: "P" | "X" };
 export type RewriteManifest = {
     operationId: string;
     sessionId: string;
@@ -15,7 +16,7 @@ export type RewriteManifest = {
     selectedIds: string[];
     branchIds: string[];
     originalHash: string;
-    choices: Choice[];
+    choicesHash: string;
     originalEstimatedTokens: number;
 };
 export type RewriteWorkspace = {
@@ -23,10 +24,12 @@ export type RewriteWorkspace = {
     originalPath: string;
     contextPath: string;
     choicesPath: string;
+    manifestPath: string;
     instructionsPath: string;
     readyPath: string;
     manifestHash: string;
     manifest: RewriteManifest;
+    choices: ChoiceOverride[];
 };
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -45,6 +48,7 @@ const payload = (entry: SessionEntry) => {
 const paths = (directory: string) => ({
     directory, originalPath: path.join(directory, "original.jsonl"), contextPath: path.join(directory, "context.jsonl"),
     choicesPath: path.join(directory, "choices.json"), instructionsPath: path.join(directory, "instructions.md"),
+    manifestPath: path.join(directory, "manifest.json"),
     readyPath: path.join(directory, "ready.json"),
 });
 const object = (v: unknown): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -169,24 +173,25 @@ export async function prepareWorkspace(sm: SessionManager, items: ActionItem[]):
     if (dependencyErrors.length) fail(dependencyErrors.join("\n"));
     const original = [...[header], ...sm.getEntries()].map(record => JSON.stringify(record)).join("\n") + "\n";
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-treebase-"));
-    const visible = new Set(sm.buildSessionProjection().entries.filter(e => e.messages.length).map(e => e.sourceEntry.id));
+    const choices: ChoiceOverride[] = items.filter(item => item.action !== "model")
+        .map(item => ({ id: item.id, action: item.action === "pick" ? "P" : "X" }));
+    const choicesText = JSON.stringify(choices, null, 2) + "\n";
     const manifest: RewriteManifest = {
         operationId: randomUUID(), sessionId: sm.getSessionId(), originalLeaf: leaf,
         selectedParent: items[0].entry.parentId, selectedIds: items.map(i => i.id),
         branchIds: selected.map(e => e.id),
         originalHash: hash(original), originalEstimatedTokens: estimated(sm),
-        choices: items.map((item, i) => ({ id: item.id, action: item.action, protected: !!canonicalItems[i].protected,
-            hash: hash(canonical(item.entry)), projected: visible.has(item.id) }))
-            .filter(choice => choice.action !== "model"),
+        choicesHash: hash(choicesText),
     };
     const manifestText = JSON.stringify(manifest, null, 2) + "\n";
-    const workspace = { ...paths(directory), manifest, manifestHash: hash(manifestText) };
+    const workspace = { ...paths(directory), manifest, choices, manifestHash: hash(manifestText) };
     await fs.writeFile(workspace.originalPath, original, { mode: 0o400 });
     const actions = new Map(items.map(item => [item.id, item.action]));
     const editable = selected.filter(entry => actions.get(entry.id) !== "remove").map(entry =>
         actions.get(entry.id) === "model" ? exportSource(entry) : { source: entry.id });
     await fs.writeFile(workspace.contextPath, editable.map(record => JSON.stringify(record)).join("\n") + "\n");
-    await fs.writeFile(workspace.choicesPath, manifestText);
+    await fs.writeFile(workspace.choicesPath, choicesText);
+    await fs.writeFile(workspace.manifestPath, manifestText);
     await fs.writeFile(path.join(directory, "context.schema.json"), JSON.stringify(contextSchema, null, 2));
     await fs.writeFile(path.join(directory, "choices.schema.json"), JSON.stringify(choicesSchema, null, 2));
     await fs.writeFile(workspace.instructionsPath, instructions(workspace));
@@ -195,16 +200,23 @@ export async function prepareWorkspace(sm: SessionManager, items: ActionItem[]):
 
 export async function loadWorkspace(directory: string, expectedManifestHash: string): Promise<RewriteWorkspace> {
     const files = paths(directory);
-    const text = await fs.readFile(files.choicesPath, "utf8");
-    if (hash(text) !== expectedManifestHash) fail("choices.json changed; restore the immutable manifest before continuing");
+    const text = await fs.readFile(files.manifestPath, "utf8");
+    if (hash(text) !== expectedManifestHash) fail("manifest.json changed; restore the immutable manifest before continuing");
     const manifest = JSON.parse(text) as RewriteManifest;
     exactKeys(manifest, ["operationId", "sessionId", "originalLeaf", "selectedParent", "selectedIds",
-        "branchIds", "originalHash", "choices", "originalEstimatedTokens"]);
-    if (!Array.isArray(manifest.branchIds) || !Array.isArray(manifest.choices))
+        "branchIds", "originalHash", "choicesHash", "originalEstimatedTokens"]);
+    if (!Array.isArray(manifest.branchIds) || typeof manifest.choicesHash !== "string")
         fail("Unsupported rewrite manifest; finish or cancel old workspaces before updating");
-    if (manifest.choices.some(c => !["pick", "remove"].includes(c.action)))
-        fail("choices must contain only P/X overrides");
-    return { ...files, manifest, manifestHash: expectedManifestHash };
+    const choicesText = await fs.readFile(files.choicesPath, "utf8");
+    if (hash(choicesText) !== manifest.choicesHash) fail("choices.json changed; restore the immutable choices before continuing");
+    const choices = JSON.parse(choicesText) as ChoiceOverride[];
+    if (!Array.isArray(choices)) fail("choices must be a list of P/X overrides");
+    for (const choice of choices) {
+        if (!object(choice) || typeof choice.id !== "string" || !["P", "X"].includes(choice.action))
+            fail("choices must contain only P/X overrides");
+        exactKeys(choice, ["id", "action"]);
+    }
+    return { ...files, manifest, choices, manifestHash: expectedManifestHash };
 }
 
 /** Only selected raw entries plus explicitly attributed insertions become the final branch. */
@@ -233,15 +245,14 @@ export async function validateWorkspace(sm: SessionManager, workspace: RewriteWo
     const snapshot = SessionManager.inMemory(sm.getCwd(), undefined, [original.header, ...original.entries]);
     snapshot.branch(manifest.originalLeaf);
     const canonicalItems = makeActionItems(branch.slice(start), snapshot.buildSessionProjection());
-    const explicit = new Map(manifest.choices.map(c => [c.id, c]));
-    if (explicit.size !== manifest.choices.length || manifest.choices.some(c => !manifest.selectedIds.includes(c.id)))
+    const explicit = new Map(verified.choices.map(c => [c.id, c]));
+    if (explicit.size !== verified.choices.length || verified.choices.some(c => !manifest.selectedIds.includes(c.id)))
         fail("Invalid choice IDs");
     const choices = new Map(manifest.selectedIds.map((id, i) => {
-        const before = originalById.get(id)!;
-        const choice = explicit.get(id) ?? { id, action: "model" as const, protected: false,
-            hash: hash(canonical(before)), projected: true };
-        if (choice.hash !== hash(canonical(before))) fail(`Snapshot choice hash mismatch for ${id}`);
-        if (canonicalItems[i].protected && (!choice.protected || choice.action !== "pick"))
+        const override = explicit.get(id);
+        const choice: Choice = { id, action: override?.action === "P" ? "pick" : override?.action === "X" ? "remove" : "model",
+            protected: !!canonicalItems[i].protected };
+        if (choice.protected && choice.action !== "pick")
             fail(`Locked source ${id} must be preserved`);
         return [id, choice] as const;
     }));
@@ -473,8 +484,11 @@ little as possible during the process of doing these edits to your future contex
 
 Edit ONLY ${workspace.contextPath}.
 
-Read choices.json and context.schema.json. choices contain user choices for what to keep and delete;
-selectedIds absent from choices imply you choose what to do. original.jsonl is the immutable full
+Read choices.json, manifest.json and context.schema.json. choices.json is a list of
+{"id":"original-id","action":"P"} or {"id":"original-id","action":"X"} overrides.
+manifest.json contains internal selection and integrity bookkeeping; do not edit it
+or choices.json. Its selectedIds absent from choices imply you choose what to do.
+original.jsonl is the immutable full
 session snapshot; context.jsonl exports only the current branch.
 
 Each nonblank line is one editing record. Line order determines ancestry.
@@ -582,16 +596,10 @@ const contextSchema = {
     ],
 };
 const choicesSchema = {
-    $schema: "https://json-schema.org/draft/2020-12/schema", type: "object", additionalProperties: false,
-    required: ["operationId", "sessionId", "originalLeaf", "selectedParent", "selectedIds", "branchIds", "originalHash", "choices", "originalEstimatedTokens"],
-    properties: {
-        operationId: { type: "string" }, sessionId: { type: "string" }, originalLeaf: { type: "string" },
-        selectedParent: { type: ["string", "null"] }, selectedIds: { type: "array", items: { type: "string" } },
-        branchIds: { type: "array", items: { type: "string" } }, originalHash: { type: "string" },
-        originalEstimatedTokens: { type: "number", minimum: 0 },
-        choices: { type: "array", description: "Only P/X overrides. Unlisted selectedIds imply M.",
-            items: { type: "object", additionalProperties: false, required: ["id", "action", "protected", "hash", "projected"],
-                properties: { id: { type: "string" }, action: { enum: ["pick", "remove"] },
-                    protected: { type: "boolean" }, hash: { type: "string" }, projected: { type: "boolean" } } } },
+    $schema: "https://json-schema.org/draft/2020-12/schema", type: "array",
+    description: "Only P/X overrides. Unlisted selected IDs imply M.",
+    items: {
+        type: "object", additionalProperties: false, required: ["id", "action"],
+        properties: { id: { type: "string" }, action: { enum: ["P", "X"] } },
     },
 };
