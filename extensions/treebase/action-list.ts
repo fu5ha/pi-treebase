@@ -154,7 +154,15 @@ function makeModel(items: ActionItem[]): ActionModel {
             const visibleAssistantRows = groupRows.filter(
                 (row) => row.visible && row.entry.type === "message" && row.entry.message?.role === "assistant",
             );
-            const finalRowIndex = visibleAssistantRows.at(-1)?.index;
+            const lastAssistantRow = visibleAssistantRows.at(-1);
+            // A trailing tool-calling message is still an intermediate envelope,
+            // even when it contains text. Keep it with its tool results.
+            const lastAssistantContent = lastAssistantRow?.entry.type === "message"
+                && lastAssistantRow.entry.message.role === "assistant"
+                ? lastAssistantRow.entry.message.content : undefined;
+            const finalRowIndex = Array.isArray(lastAssistantContent)
+                && lastAssistantContent.some((block) => block.type === "toolCall")
+                ? undefined : lastAssistantRow?.index;
             if (finalRowIndex !== undefined) rows[finalRowIndex].kind = "assistant-final";
             turn = {
                 kind: "assistant",
@@ -232,6 +240,7 @@ function splitAssistantTurn(
     if (turn.rowIndexes.some((index) => !model.rows[index].actionable)) return;
     if (turn.finalRowIndex === undefined) return setWholeTurnAction(model, turn, intermediateAction);
     const intermediateRows = turn.rowIndexes.filter((i) => i !== turn.finalRowIndex);
+    if (intermediateRows.length === 0) return setWholeTurnAction(model, turn, finalAction);
     replaceTurnGroups(model, turn, [
         { id: `turn:${turn.index}:intermediate`, rowIndexes: intermediateRows, action: intermediateAction },
         { id: `turn:${turn.index}:final`, rowIndexes: [turn.finalRowIndex], action: finalAction },
@@ -284,12 +293,14 @@ function setRowActionInAssistantTurn(
     const turnIsUnified = selectedGroupId === finalGroupId;
     const selectedIsFinal = rowIndex === turn.finalRowIndex;
 
-    // The one special case: while an assistant turn is unified, changing a
-    // tool/intermediate row must split it so the final response keeps its
-    // existing action. After a turn is already split, generic group mutation +
-    // normalization handles both edits and re-joins.
-    if (turnIsUnified && !selectedIsFinal && finalGroup && action !== finalGroup.action) {
-        splitAssistantTurn(model, turn, action, finalGroup.action);
+    // Editing either side of a unified turn splits it, preserving the other
+    // side's action. Tool envelopes and results remain together on the
+    // intermediate side. Generic mutation + normalization handles later edits
+    // and re-joins when both sides have the same action again.
+    if (turnIsUnified && finalGroup && action !== finalGroup.action) {
+        splitAssistantTurn(model, turn,
+            selectedIsFinal ? finalGroup.action : action,
+            selectedIsFinal ? action : finalGroup.action);
         return;
     }
 

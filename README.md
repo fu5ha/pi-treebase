@@ -22,7 +22,9 @@ pi install npm:@grayolson/pi-treebase
 
    System/state records, structural reference targets, and inactive raw history
    are locked and preserved automatically. Group navigation and tool dependency
-   checks prevent contradictory P/X selections. Shift+Enter saves a raw/projected
+   checks prevent contradictory P/X selections. Changing a final assistant
+   response affects only that response; tool/intermediate messages stay grouped.
+   Shift+Enter saves a raw/projected
    context preview and cancels selection.
 4. The current agent edits a duplicate JSONL using its existing context and
    normal tools on a temporary branch. It receives schemas, a choices manifest,
@@ -50,7 +52,8 @@ X is **not** a confidentiality boundary: originals, backups and the working
 agent's context still contain that material.
 
 Record IDs and M-source provenance identify replacements, not mutable line
-numbers. New synthesized context uses custom messages; instructions define the
+numbers. `choices.json` lists only P/X overrides; unlisted selected IDs imply M.
+New synthesized context uses custom messages; instructions define the
 permitted insertion slots around P anchors. Outside-range records and unrelated
 branches cannot change. Validation checks preserved payloads, references, tool
 pairing, native projection and reconstruction before activating anything.
