@@ -154,12 +154,50 @@ export function makeActionItems(entries: SessionEntry[], projection?: SessionPro
             groupId, depth: 0, protected: protectedEntry, protectedReason,
         };
     });
-    // A referenced or inactive assistant envelope must keep its matching tool
-    // results, even when only one member was directly protected.
-    const protectedGroups = new Set(items.filter((item) => item.protected).map((item) => item.groupId));
-    return items.map((item) => protectedGroups.has(item.groupId)
-        ? { ...item, protected: true, action: "pick", protectedReason: item.protectedReason ?? "locked tool dependency group" }
-        : item);
+    // Action/navigation groups are not dependencies. Only an assistant tool-call
+    // envelope and its matching results must share protection. Multiple calls in
+    // one envelope form a single dependency component, not a whole assistant turn.
+    const calls = new Map<string, ActionItem[]>();
+    const dependencies = new Map<string, Set<string>>();
+    const connect = (a: string, b: string) => {
+        if (!dependencies.has(a)) dependencies.set(a, new Set());
+        if (!dependencies.has(b)) dependencies.set(b, new Set());
+        dependencies.get(a)!.add(b);
+        dependencies.get(b)!.add(a);
+    };
+    for (const item of items) {
+        if (item.entry.type !== "message" || item.entry.message.role !== "assistant") continue;
+        for (const block of item.entry.message.content) {
+            if (block.type !== "toolCall") continue;
+            const key = JSON.stringify([block.id, block.name]);
+            const envelopes = calls.get(key) ?? [];
+            envelopes.push(item);
+            calls.set(key, envelopes);
+        }
+    }
+    for (const item of items) {
+        if (item.entry.type !== "message" || item.entry.message.role !== "toolResult") continue;
+        const result = item.entry.message;
+        for (const envelope of calls.get(JSON.stringify([result.toolCallId, result.toolName])) ?? [])
+            connect(envelope.id, item.id);
+    }
+    const locked = new Map(items.filter(item => item.protected)
+        .map(item => [item.id, { id: item.id, reason: item.protectedReason! }]));
+    const queue = [...locked.keys()];
+    for (let i = 0; i < queue.length; i++) {
+        const id = queue[i];
+        for (const dependency of dependencies.get(id) ?? []) {
+            if (locked.has(dependency)) continue;
+            locked.set(dependency, locked.get(id)!);
+            queue.push(dependency);
+        }
+    }
+    return items.map(item => {
+        const origin = locked.get(item.id);
+        return origin ? { ...item, protected: true, action: "pick",
+            protectedReason: item.protectedReason ??
+                `tool dependency on ${origin.id} (${origin.reason})` } : item;
+    });
 }
 
 export function setGroupAction(
