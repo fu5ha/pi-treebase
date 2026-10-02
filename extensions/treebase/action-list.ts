@@ -14,8 +14,7 @@ import {
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildSummarizerContext, projectActionItems } from "./summarize.js";
-import { actionLetter, entryTitle, isTreebaseActionableEntry, type ActionItem, type TreebaseAction } from "./tree-utils.js";
+import { actionDependencyErrors, actionLetter, entryTitle, isTreebaseActionableEntry, type ActionItem, type TreebaseAction } from "./tree-utils.ts";
 
 type Theme = any;
 type ToolCallInfo = { name: string; arguments: Record<string, any> };
@@ -189,7 +188,7 @@ function getVisibleRows(model: ActionModel): VisibleActionRow[] {
         .filter((row) => row.visible)
         .map((row) => {
             const groupId = row.groupId ?? `row:${row.index}`;
-            const action = model.groups.get(groupId)?.action ?? "summarize-low";
+            const action = model.groups.get(groupId)?.action ?? "model";
             return { rowIndex: row.index, groupId, action, groupPosition: "only" as const };
         });
 
@@ -230,6 +229,7 @@ function splitAssistantTurn(
     intermediateAction: TreebaseAction,
     finalAction: TreebaseAction,
 ): void {
+    if (turn.rowIndexes.some((index) => !model.rows[index].actionable)) return;
     if (turn.finalRowIndex === undefined) return setWholeTurnAction(model, turn, intermediateAction);
     const intermediateRows = turn.rowIndexes.filter((i) => i !== turn.finalRowIndex);
     replaceTurnGroups(model, turn, [
@@ -321,16 +321,26 @@ class ActionList {
     private model: ActionModel;
     private toolCallMap = new Map<string, ToolCallInfo>();
     private maxVisibleLines: number;
+    private done: (items: ActionItem[] | null) => void;
+    private theme: Theme;
+    private ctx: ExtensionCommandContext;
+    private keybindings: KeybindingsManager;
+    private terminal: { rows: number };
 
     constructor(
         items: ActionItem[],
-        private done: (items: ActionItem[] | null) => void,
-        private theme: Theme,
+        done: (items: ActionItem[] | null) => void,
+        theme: Theme,
         terminalHeight: number,
-        private ctx: ExtensionCommandContext,
-        private keybindings: KeybindingsManager,
-        private terminal: { rows: number },
+        ctx: ExtensionCommandContext,
+        keybindings: KeybindingsManager,
+        terminal: { rows: number },
     ) {
+        this.done = done;
+        this.theme = theme;
+        this.ctx = ctx;
+        this.keybindings = keybindings;
+        this.terminal = terminal;
         this.model = makeModel(items);
         this.maxVisibleLines = Math.max(8, Math.floor(terminalHeight / 2));
         this.buildToolCallMap();
@@ -379,7 +389,7 @@ class ActionList {
             );
             const prefix = this.formatGroupPrefix(view.groupPosition);
             const content = this.getEntryDisplayText(row.entry, isSelected)
-                + (row.actionable ? "" : this.theme.fg("dim", " (preserved)"));
+                + (row.actionable ? "" : this.theme.fg("dim", ` (locked: ${row.source.protectedReason ?? "preserved"})`));
             let line = cursor + action + " " + this.theme.fg("dim", prefix) + content;
             if (isSelected) line = this.theme.bg("selectedBg", line);
             lines.push(truncateToWidth(line, width));
@@ -398,7 +408,7 @@ class ActionList {
             truncateToWidth(
                 this.theme.fg(
                     "muted",
-                    "  ↑/↓: move. ←/→: prev/next group. P/H/L/D: set group action. Enter: confirm. Esc: cancel.",
+                    "  ↑/↓: move. ←/→: prev/next group. P/M/X: set group action. Enter: confirm. Esc: cancel.",
                 ),
                 width,
             ),
@@ -407,7 +417,7 @@ class ActionList {
             truncateToWidth(
                 this.theme.fg(
                     "dim",
-                    "   Shift+Enter write message that would have been sent to summarizer model to disk and cancel.",
+                    "   Shift+Enter: save raw/projected context preview and cancel.",
                 ),
                 width,
             ),
@@ -424,9 +434,8 @@ class ActionList {
         const styled = (() => {
             switch (action) {
                 case "pick": return this.theme.fg("warning", label);
-                case "summarize-high": return this.theme.fg("accent", label);
-                case "summarize-low": return this.theme.fg("success", label);
-                case "drop": return this.theme.fg("error", label);
+                case "model": return this.theme.fg("accent", label);
+                case "remove": return this.theme.fg("error", label);
             }
         })();
         return subtle ? styled : this.theme.bold(styled);
@@ -441,7 +450,14 @@ class ActionList {
 
     private setCurrent(action: TreebaseAction) {
         const selected = getVisibleRows(this.model)[this.model.selectedVisibleIndex];
-        if (selected) setRowAction(this.model, selected.rowIndex, action);
+        if (selected) {
+            const row = this.model.rows[selected.rowIndex];
+            if (!row.actionable) {
+                this.ctx.ui.notify(`Locked: ${row.source.protectedReason ?? "preserved"}`, "warning");
+                return;
+            }
+            setRowAction(this.model, selected.rowIndex, action);
+        }
     }
 
     private jumpGroup(direction: "up" | "down") {
@@ -480,22 +496,31 @@ class ActionList {
         } else if (kb.matches(data, "app.tree.unfoldOrDown") || kb.matches(data, "tui.editor.cursorRight") || matchesKey(data, Key.right)) {
             this.jumpGroup("down");
         } else if (matchesKey(data, Key.shift("enter")) || kb.matches(data, "tui.input.newLine")) {
-            this.writeSummarizerMessageAndCancel();
+            this.writeContextPreviewAndCancel();
         } else if (kb.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
-            this.done(toActionItems(this.model));
+            const items = toActionItems(this.model);
+            const errors = actionDependencyErrors(items, this.ctx.sessionManager.getBranch());
+            if (errors.length) this.ctx.ui.notify(errors.join("\n"), "error");
+            else this.done(items);
         } else if (kb.matches(data, "tui.select.cancel") || matchesKey(data, Key.escape)) {
             this.done(null);
         } else if (data.toLowerCase() === "p") this.setCurrent("pick");
-        else if (data.toLowerCase() === "h") this.setCurrent("summarize-high");
-        else if (data.toLowerCase() === "l") this.setCurrent("summarize-low");
-        else if (data.toLowerCase() === "d") this.setCurrent("drop");
+        else if (data.toLowerCase() === "m") this.setCurrent("model");
+        else if (data.toLowerCase() === "x") this.setCurrent("remove");
     }
 
-    private writeSummarizerMessageAndCancel(): void {
-        const message = buildSummarizerContext(projectActionItems(this.ctx, toActionItems(this.model))).message;
-        const tmpFile = path.join(os.tmpdir(), `pi-treebase-summarizer-message-${Date.now()}.xml`);
-        fs.writeFileSync(tmpFile, message || "<!-- No summarize-high/summarize-low groups selected. -->\n", "utf-8");
-        this.ctx.ui.notify(`Treebase summarizer message written to: ${tmpFile}`, "info");
+    private writeContextPreviewAndCancel(): void {
+        const items = toActionItems(this.model);
+        const selected = new Set(items.map((item) => item.id));
+        const preview = {
+            choices: items.map(({ id, action, protected: locked, protectedReason }) => ({ id, action, locked, protectedReason })),
+            rawHistory: items.map((item) => item.entry),
+            projectedContext: this.ctx.sessionManager.buildSessionProjection().entries
+                .filter((entry) => selected.has(entry.sourceEntry.id)),
+        };
+        const tmpFile = path.join(os.tmpdir(), `pi-treebase-context-preview-${Date.now()}.json`);
+        fs.writeFileSync(tmpFile, JSON.stringify(preview, null, 2) + "\n", "utf-8");
+        this.ctx.ui.notify(`Treebase context preview written to: ${tmpFile}`, "info");
         this.done(null);
     }
 
@@ -617,7 +642,7 @@ export async function showActionList(
                 const activeTheme = ctx.ui.theme;
                 title.setText(activeTheme.fg("accent", activeTheme.bold("Treebase Actions")));
                 help.setText(activeTheme.fg("muted",
-                    "P - pick, H / L - summarize, D - drop. Structural and inactive history rows are preserved."));
+                    "P - pick, M - model choice (default), X - remove. Locked records preserve raw history / bookkeeping."));
                 return container.render(Math.max(3, w)).map(line => truncateToWidth(line, w));
             },
             invalidate: () => container.invalidate(),

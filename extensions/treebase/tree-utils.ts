@@ -15,9 +15,8 @@ export type TreeNode = {
 
 export type TreebaseAction =
     | "pick"
-    | "summarize-high"
-    | "summarize-low"
-    | "drop";
+    | "model"
+    | "remove";
 
 export type ActionItem = {
     index: number;
@@ -26,8 +25,9 @@ export type ActionItem = {
     action: TreebaseAction;
     groupId: string;
     depth: number;
-    /** Structural/state records can only be preserved, never summarized or dropped. */
+    /** Structural/state records can only be preserved, never rewritten or removed. */
     protected?: boolean;
+    protectedReason?: string;
 };
 
 export function isAncestor(
@@ -68,12 +68,10 @@ export function actionLetter(action: TreebaseAction): string {
     switch (action) {
         case "pick":
             return "P";
-        case "summarize-high":
-            return "H";
-        case "summarize-low":
-            return "L";
-        case "drop":
-            return "D";
+        case "model":
+            return "M";
+        case "remove":
+            return "X";
     }
 }
 
@@ -116,9 +114,11 @@ export function makeActionItems(entries: SessionEntry[], projection?: SessionPro
     let assistantGroupId: string | null = null;
 
     const items: ActionItem[] = entries.map((entry, index) => {
-        const protectedEntry = !isTreebaseActionableEntry(entry)
-            || referencedIds.has(entry.id)
-            || (visibleIds !== undefined && !visibleIds.has(entry.id));
+        const protectedReason = !isTreebaseActionableEntry(entry) ? "system / bookkeeping"
+            : referencedIds.has(entry.id) ? "structural reference target"
+            : visibleIds !== undefined && !visibleIds.has(entry.id) ? "inactive raw history"
+            : undefined;
+        const protectedEntry = protectedReason !== undefined;
         const role =
             entry.type === "message" ? entry.message?.role : entry.type;
         let groupId: string;
@@ -150,15 +150,15 @@ export function makeActionItems(entries: SessionEntry[], projection?: SessionPro
 
         return {
             index, id: entry.id, entry,
-            action: protectedEntry ? "pick" : "summarize-low",
-            groupId, depth: 0, protected: protectedEntry,
+            action: protectedEntry ? "pick" : "model",
+            groupId, depth: 0, protected: protectedEntry, protectedReason,
         };
     });
     // A referenced or inactive assistant envelope must keep its matching tool
     // results, even when only one member was directly protected.
     const protectedGroups = new Set(items.filter((item) => item.protected).map((item) => item.groupId));
     return items.map((item) => protectedGroups.has(item.groupId)
-        ? { ...item, protected: true, action: "pick" }
+        ? { ...item, protected: true, action: "pick", protectedReason: item.protectedReason ?? "locked tool dependency group" }
         : item);
 }
 
@@ -226,6 +226,31 @@ export function systemUpdateTitle(message: {
     return `[system: ${changes.join("; ")}]`;
 }
 
-export function serializeEntryForSummary(entry: SessionEntry): string {
-    return JSON.stringify(entry, null, 2);
+/** Report contradictions; never silently repair a user's P or X selection. */
+export function actionDependencyErrors(items: ActionItem[], branch: SessionEntry[]): string[] {
+    const actions = new Map(items.map((item) => [item.id, item.action]));
+    const calls = new Map<string, { entry: SessionEntry; action: TreebaseAction }>();
+    const results = new Map<string, { entry: SessionEntry; action: TreebaseAction }[]>();
+    for (const entry of branch) {
+        if (entry.type !== "message") continue;
+        const action = actions.get(entry.id) ?? "pick";
+        if (entry.message.role === "assistant") {
+            for (const block of entry.message.content) {
+                if (block.type === "toolCall") calls.set(block.id, { entry, action });
+            }
+        } else if (entry.message.role === "toolResult") {
+            const id = entry.message.toolCallId;
+            results.set(id, [...(results.get(id) ?? []), { entry, action }]);
+        }
+    }
+    const errors: string[] = [];
+    for (const [id, call] of calls) {
+        for (const result of results.get(id) ?? []) {
+            if ((call.action === "pick" && result.action === "remove")
+                || (call.action === "remove" && result.action === "pick")) {
+                errors.push(`Tool ${id}: ${call.entry.id} is ${actionLetter(call.action)}, but result ${result.entry.id} is ${actionLetter(result.action)}. Choose compatible actions.`);
+            }
+        }
+    }
+    return errors;
 }

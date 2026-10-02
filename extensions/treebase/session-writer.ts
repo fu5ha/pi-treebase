@@ -1,12 +1,12 @@
 import {
     SessionManager,
-    type ExtensionCommandContext,
+    type ExtensionContext,
     type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 
 /** pi 1.0 commands expose a read-only view of the live writable manager. */
-export function writableManager(ctx: ExtensionCommandContext): SessionManager {
+export function writableManager(ctx: ExtensionContext): SessionManager {
     const manager = ctx.sessionManager;
     if (!(manager instanceof SessionManager)) {
         throw new Error("Treebase requires the pi 1.0 SessionManager");
