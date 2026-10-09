@@ -31,3 +31,17 @@ pi install npm:@grayolson/pi-treebase
 
 Interrupted or invalid runs are not applied. Use `/treebase resume` to
 continue/repair, or `/treebase cancel` to return to the original branch.
+
+## Automatic full-branch rewrite
+
+Run `/treebase-auto "prompt"` to rewrite the current branch from its root to
+the current leaf without the tree selector or P/M/X picker. All editable
+entries default to model choice; locked entries remain preserved.
+This command also works outside TUI mode (for example, in T3 Code), as do
+`/treebase resume` and `/treebase cancel`. Interactive `/treebase` requires TUI mode.
+
+The prompt gives the editing LLM user context about how the session will
+continue, helping it decide what to retain or consolidate. It is guidance for
+the rewrite, not a task to execute during editing. The same validation,
+automatic activation, and resume/cancel workflow applies, and `/treebase resume`
+retains this guidance.

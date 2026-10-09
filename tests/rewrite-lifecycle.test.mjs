@@ -1,11 +1,81 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { writeFile, rm } from "node:fs/promises";
+import { readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/treebase/index.ts";
 import { prepareWorkspace } from "../extensions/treebase/rewrite-workspace.ts";
 import { makeActionItems } from "../extensions/treebase/tree-utils.ts";
+
+for (const mode of ["tui", "rpc"]) {
+test(`auto selects the full active branch without pickers and supports resume/cancel in ${mode} mode`, async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    const root = sm.appendCustomEntry("initial-state", { keep: true });
+    sm.appendMessage({ role: "user", content: "earlier work", timestamp: 1 });
+    const originalLeaf = sm.appendMessage({ role: "user", content: "latest work", timestamp: 2 });
+    const originalBranch = sm.getBranch();
+    const commands = new Map(), messages = [], notices = [];
+    extension({
+        on: () => {},
+        registerCommand: (name, command) => commands.set(name, command),
+        sendUserMessage: message => messages.push(message),
+    });
+    const ctx = {
+        mode, sessionManager: sm, waitForIdle: async () => {},
+        // No custom UI: either picker would fail this test.
+        ui: { notify: message => notices.push(message) },
+        navigateTree: async target => { sm.branch(target); return { cancelled: false }; },
+    };
+    const command = args => commands.get("treebase").handler(args, ctx);
+    await commands.get("treebase-auto").handler('"Focus on implementing the next feature"', ctx);
+    const state = sm.getBranch().findLast(e => e.type === "custom" && e.customType === "treebase.operation")?.data;
+    assert.ok(state, notices.join("\n"));
+    try {
+        const manifest = JSON.parse(await readFile(join(state.directory, "manifest.json"), "utf8"));
+        assert.equal(manifest.selectedParent, null);
+        assert.deepEqual(manifest.selectedIds, originalBranch.map(e => e.id));
+        assert.equal(manifest.selectedIds[0], root);
+        assert.equal(state.originalLeaf, originalLeaf);
+        assert.equal(state.continuationContext, "Focus on implementing the next feature");
+        assert.match(messages[0], /User context for how the session will continue/);
+        assert.match(messages[0], /Focus on implementing the next feature/);
+        await command("resume");
+        assert.match(messages[1], /Focus on implementing the next feature/);
+        await command("cancel");
+        assert.equal(sm.buildSessionProjection().messages.filter(m => m.role === "user").length, 2);
+    } finally {
+        await rm(state.directory, { recursive: true, force: true });
+    }
+});
+}
+
+test("interactive treebase still requires TUI mode", async () => {
+    const commands = new Map(), notices = [];
+    extension({ on: () => {}, registerCommand: (name, command) => commands.set(name, command) });
+    await commands.get("treebase").handler("", {
+        mode: "rpc", ui: { notify: message => notices.push(message) },
+    });
+    assert.match(notices.at(-1), /\/treebase requires TUI mode/);
+});
+
+test("auto requires a nonempty prompt before modifying the session", async () => {
+    const sm = SessionManager.inMemory(process.cwd());
+    sm.appendMessage({ role: "user", content: "original", timestamp: 1 });
+    const leaf = sm.getLeafId(), commands = new Map(), notices = [];
+    extension({ on: () => {}, registerCommand: (name, command) => commands.set(name, command) });
+    const ctx = {
+        mode: "tui", sessionManager: sm, waitForIdle: async () => {},
+        ui: { notify: message => notices.push(message) },
+    };
+    for (const args of ["", '""', '"unterminated']) {
+        await commands.get("treebase-auto").handler(args, ctx);
+        assert.match(notices.at(-1), /Treebase failed/);
+        assert.equal(sm.getLeafId(), leaf);
+    }
+    await commands.get("treebase").handler('auto "prompt"', ctx);
+    assert.match(notices.at(-1), /Use \/treebase \[resume\|cancel\]/);
+    assert.equal(sm.getLeafId(), leaf);
+});
 
 test("only successful completed editing activates; revisiting a working branch cannot commit twice", async () => {
     const sm = SessionManager.inMemory(process.cwd());
@@ -31,7 +101,7 @@ test("only successful completed editing activates; revisiting a working branch c
             ui: { notify: message => notices.push(message) },
             navigateTree: async target => { sm.branch(target); return { cancelled: false }; },
         };
-        assert.deepEqual([...commands.keys()], ["treebase"]);
+        assert.deepEqual([...commands.keys()], ["treebase", "treebase-auto"]);
         const command = args => commands.get("treebase").handler(args, ctx);
         const drain = async () => {
             for (let i = 0; i < 100 && !notices.at(-1)?.match(/branch created|activation failed/); i++)

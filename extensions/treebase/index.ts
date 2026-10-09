@@ -22,7 +22,15 @@ type Operation = {
     repairs: number;
     diagnostic?: string;
     finalLeaf?: string | null;
+    continuationContext?: string;
 };
+
+function continuationGuidance(prompt?: string): string {
+    return prompt === undefined ? "" : `
+User context for how the session will continue (use this to decide which facts and history to retain, not as a task to execute during this editing run):
+${JSON.stringify(prompt)}
+`;
+}
 
 function operation(ctx: ExtensionContext): Operation | undefined {
     for (const entry of ctx.sessionManager.getBranch().slice().reverse()) {
@@ -206,8 +214,8 @@ export default function (pi: ExtensionAPI) {
         else if (op?.status === "editing") ctx.ui.notify("Treebase not completed. Use /treebase resume or cancel.", "info");
     });
 
-    const handler = async (args: string, ctx: ExtensionCommandContext) => {
-        if (ctx.mode !== "tui") {
+    const handler = async (args: string, ctx: ExtensionCommandContext, auto = false) => {
+        if (!auto && !["resume", "cancel"].includes(args.trim()) && ctx.mode !== "tui") {
             ctx.ui.notify("/treebase requires TUI mode", "error");
             return;
         }
@@ -215,8 +223,18 @@ export default function (pi: ExtensionAPI) {
         const sm = writableManager(ctx);
         try {
             const subcommand = args.trim();
+            let continuationContext: string | undefined;
+            if (auto) {
+                const prompt = subcommand;
+                if (!prompt) throw new Error('Use /treebase-auto "prompt"');
+                // Accept a JSON-quoted prompt or plain text, preserving its contents.
+                continuationContext = prompt.startsWith('"') ? JSON.parse(prompt) : prompt;
+                if (typeof continuationContext !== "string" || !continuationContext.trim()) {
+                    throw new Error('Use /treebase-auto "prompt"');
+                }
+            }
             const op = operation(ctx);
-            if (subcommand) {
+            if (subcommand && !auto) {
                 if (!["resume", "cancel"].includes(subcommand)) throw new Error("Use /treebase [resume|cancel]");
                 if (!op || ["committed", "cancelled"].includes(op.status)) throw new Error("No active treebase operation on this branch");
                 assertWorking(ctx, op);
@@ -234,7 +252,7 @@ export default function (pi: ExtensionAPI) {
                     commandContexts.set(op.operationId, ctx);
                     await unlink(join(work.directory, "ready.json")).catch(() => {});
                     sm.appendCustomEntry(STATE, { ...op, status: "editing", repairs: 0 });
-                    pi.sendUserMessage(`Continue the treebase operation ${op.operationId}. Inspect ${work.instructionsPath} and repair/edit ${work.contextPath}. ${op.diagnostic ?? ""}`);
+                    pi.sendUserMessage(`Continue the treebase operation ${op.operationId}. Inspect ${work.instructionsPath} and repair/edit ${work.contextPath}. ${op.diagnostic ?? ""}${continuationGuidance(op.continuationContext)}`);
                     return;
                 }
                 return;
@@ -242,11 +260,11 @@ export default function (pi: ExtensionAPI) {
             if (op && ["editing", "ready", "failed"].includes(op.status)) throw new Error("An operation is already active. Use /treebase resume or cancel");
             const originalLeaf = sm.getLeafId();
             if (!originalLeaf) throw new Error("No current session leaf");
-            const target = await showTreeSelector(ctx, pi);
+            const target = auto ? sm.getBranch(originalLeaf)[0]?.id : await showTreeSelector(ctx, pi);
             if (!target) return;
             if (!isAncestor(sm, target, originalLeaf)) throw new Error("Choose an earlier entry in the current branch; unrelated destinations cannot be rewritten");
             const items = makeActionItems(entriesBetweenAncestorAndLeaf(sm, target, originalLeaf), sm.buildSessionProjection());
-            const edited = await showActionList(ctx, items);
+            const edited = auto ? items : await showActionList(ctx, items);
             if (!edited) return;
             const work = await prepareWorkspace(sm, edited);
             // Snapshot is complete before the first working-branch record.
@@ -255,6 +273,7 @@ export default function (pi: ExtensionAPI) {
                 operationId: work.manifest.operationId, sessionId: sm.getSessionId(),
                 originalLeaf, workingAnchor, directory: work.directory,
                 manifestHash: work.manifestHash, status: "editing", repairs: 0,
+                ...(continuationContext === undefined ? {} : { continuationContext }),
             };
             const stateId = sm.appendCustomEntry(STATE, state);
             await activate(ctx, stateId, originalLeaf);
@@ -262,6 +281,7 @@ export default function (pi: ExtensionAPI) {
             pi.sendUserMessage(`Perform controlled editing on your own context for continued work based on treebase operation ${state.operationId}.
 - Read ${work.instructionsPath}
 - Inspect programmatically, batch precise edits, preserve retained facts concisely, and don't reintroduce removed material.
+${continuationGuidance(continuationContext)}
 When finished, write ${join(work.directory, "ready.json")} containing {"operationId":"${state.operationId}"} and end your turn. The validated result will be activated automatically after your run settles.`);
             ctx.ui.notify(`Treebase editing on a temporary branch.\nArtifacts: ${work.directory}`, "info");
         } catch (error) {
@@ -270,5 +290,9 @@ When finished, write ${join(work.directory, "ready.json")} containing {"operatio
     };
     pi.registerCommand("treebase", {
         description: "Edit ancestor context with P/M/X (resume, cancel)", handler,
+    });
+    pi.registerCommand("treebase-auto", {
+        description: "Rewrite the full current branch with continuation guidance",
+        handler: (args, ctx) => handler(args, ctx, true),
     });
 }
