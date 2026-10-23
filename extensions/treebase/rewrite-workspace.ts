@@ -483,6 +483,8 @@ files you're editing into context at once; it's already there. Try to grown your
 little as possible during the process of doing these edits to your future context.
 
 Edit ONLY ${workspace.contextPath}.
+Live context labels [eid: ...] identify the source IDs used below. They are
+request-only annotations, not source content; do not copy them into edited or synthesized content.
 
 Read choices.json, manifest.json and context.schema.json. choices.json is a list of
 {"id":"original-id","action":"P"} or {"id":"original-id","action":"X"} overrides.

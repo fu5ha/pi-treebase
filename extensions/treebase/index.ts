@@ -92,6 +92,13 @@ async function activate(ctx: ExtensionCommandContext, leaf: string | null, rollb
 }
 
 export default function (pi: ExtensionAPI) {
+    pi.on("session_start", (_event, ctx) => {
+        let available = false;
+        pi.events.emit("model-exposed-entry-ids:probe", () => { available = true; });
+        if (!available) ctx.ui.notify(
+            "Treebase: install and enable @grayolson/pi-model-exposed-entry-ids to expose context entry IDs.",
+            "warning");
+    });
     // Notification-only settlement cannot durably append a receipt. After a
     // reload, require a fresh editing run rather than guessing that a persisted
     // actionable-boundary readiness record had actually reached settlement.
