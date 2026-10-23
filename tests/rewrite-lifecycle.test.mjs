@@ -31,7 +31,7 @@ test(`auto selects the full active branch without pickers and supports resume/ca
     const state = sm.getBranch().findLast(e => e.type === "custom" && e.customType === "treebase.operation")?.data;
     assert.ok(state, notices.join("\n"));
     try {
-        const manifest = JSON.parse(await readFile(join(state.directory, "manifest.json"), "utf8"));
+        const manifest = JSON.parse(await readFile(join(state.directory, "__internal", "manifest.json"), "utf8"));
         assert.equal(manifest.selectedParent, null);
         assert.deepEqual(manifest.selectedIds, originalBranch.map(e => e.id));
         assert.equal(manifest.selectedIds[0], root);

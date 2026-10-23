@@ -48,7 +48,7 @@ const payload = (entry: SessionEntry) => {
 const paths = (directory: string) => ({
     directory, originalPath: path.join(directory, "original.jsonl"), contextPath: path.join(directory, "context.jsonl"),
     choicesPath: path.join(directory, "choices.json"), instructionsPath: path.join(directory, "instructions.md"),
-    manifestPath: path.join(directory, "manifest.json"),
+    manifestPath: path.join(directory, "__internal", "manifest.json"),
     readyPath: path.join(directory, "ready.json"),
 });
 const object = (v: unknown): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -187,10 +187,11 @@ export async function prepareWorkspace(sm: SessionManager, items: ActionItem[]):
     const workspace = { ...paths(directory), manifest, choices, manifestHash: hash(manifestText) };
     await fs.writeFile(workspace.originalPath, original, { mode: 0o400 });
     const actions = new Map(items.map(item => [item.id, item.action]));
-    const editable = selected.filter(entry => actions.get(entry.id) !== "remove").map(entry =>
-        actions.get(entry.id) === "model" ? exportSource(entry) : { source: entry.id });
+    const editable = selected.filter(entry => actions.get(entry.id) !== "remove")
+        .map(entry => ({ source: entry.id }));
     await fs.writeFile(workspace.contextPath, editable.map(record => JSON.stringify(record)).join("\n") + "\n");
     await fs.writeFile(workspace.choicesPath, choicesText);
+    await fs.mkdir(path.dirname(workspace.manifestPath), { recursive: true });
     await fs.writeFile(workspace.manifestPath, manifestText);
     await fs.writeFile(path.join(directory, "context.schema.json"), JSON.stringify(contextSchema, null, 2));
     await fs.writeFile(path.join(directory, "choices.schema.json"), JSON.stringify(choicesSchema, null, 2));
@@ -351,12 +352,6 @@ function editableField(entry: SessionEntry): "content" | "output" | "summary" | 
     return undefined;
 }
 
-function exportSource(entry: SessionEntry) {
-    const field = editableField(entry);
-    return field ? { source: entry.id, [field]: entry.type === "message" ? (entry.message as any)[field] : (entry as any)[field] }
-        : { source: entry.id };
-}
-
 function parseEditingJsonl(text: string): Record<string, any>[] {
     return text.split(/\r?\n/).filter(line => line.trim()).map((line, i) => {
         let record: unknown;
@@ -477,86 +472,72 @@ function validateToolPairing(messages: ReturnType<typeof convertToLlm>) {
 function instructions(workspace: RewriteWorkspace): string {
     return `# Ordered branch context editing
 
-The context you're editing is your own current context. You are trying to retain what is relevant
-for continued work after going back to the user selected point in history. Do not read the whole
-files you're editing into context at once; it's already there. Try to grown your own context as
-little as possible during the process of doing these edits to your future context.
+Rewrite your current context to retain what matters for continued work.
+Use [eid: ...] labels in the context you already see to identify source entries.
+Read original payloads only when you need exact content you can't already see; do not reread the whole history.
 
 Edit ONLY ${workspace.contextPath}.
-Live context labels [eid: ...] identify the source IDs used below. They are
-request-only annotations, not source content; do not copy them into edited or synthesized content.
+Read choices.json and context.schema.json; do not edit them.
+The selected range of entries that you should edit runs from ${workspace.manifest.selectedIds[0]} through ${workspace.manifest.selectedIds.at(-1)}.
+choices.json lists user-decided P (preserve verbatim, including locked entries) and X (exclude)
+overrides. All other entries in the selected range are M (model-chosen) and are yours to choose to retain, rewrite or remove as you see fit.
 
-Read choices.json, manifest.json and context.schema.json. choices.json is a list of
-{"id":"original-id","action":"P"} or {"id":"original-id","action":"X"} overrides.
-manifest.json contains internal selection and integrity bookkeeping; do not edit it
-or choices.json. Its selectedIds absent from choices imply you choose what to do.
-original.jsonl is the immutable full
-session snapshot; context.jsonl exports only the current branch.
+original.jsonl is a full copy of the whole pi session, immutable. context.jsonl currently contains the current branch, which is the root to leaf branch that results in the context you can currently see.
 
 Each nonblank line is one editing record. Line order determines ancestry.
-Do not write native session records, IDs, parentId, timestamps or a session header.
-The read-only prefix before selectedIds is source-only and must remain first,
-unchanged. P/locked sources must remain source-only and in their original order.
-X sources must be absent and must not be reintroduced in synthesized context.
-X is exclusion, not confidentiality: the snapshot and your current context retain it.
+Keep the prefix before the selected range unchanged. Keep P/locked entries as
+source-only references in their original order. M entries may reorder between
+P/locked anchors, never across them. Each source reference may appear at most once.
+Omit X entries and do not reintroduce their content in summaries.
+Do not add native session records, new IDs, parentId, timestamps or a session header.
 
 ## Source entries
 
-{"source":"original-id"} keeps the full original payload.
-M entries export their original editable field: content, output or summary.
-Edit that field or remove the whole line. All other metadata is restored from the
-snapshot. Look up source-only prefix/P/locked payloads in original.jsonl when
-you need their full content or source roles/tool names; the snapshot contains
-the complete branch data and metadata.
-Assistant content includes toolCall blocks; keep them exactly.
+For each M entry:
+- Keep unchanged: use {"source":"original-id"} to retain the full original entry.
+- Edit: keep source and add a content, output or summary override, following
+  context.schema.json. Treebase replaces only that field and preserves other metadata.
+- Remove: delete the entire line.
+
+Entries initially contain only source references and retain their original payloads.
+Removing an override while keeping source restores the original payload; it does
+not empty or remove the entry. Use the context you already see for synthesis and
+deletion decisions. Look up exact original payloads in original.jsonl by source ID
+when an in-place edit requires them.
+Assistant content can contain text and toolCall blocks. You may edit its text,
+but preserve every toolCall block exactly.
 Keep tool calls and matching results together; never fabricate tool results.
-M sources may reorder within their interval between P/locked anchors, not across
-anchors. A source may appear at most once. Protected/inactive raw records stay
-protected, so old context-edit/compaction effects cannot accidentally revive history.
 
 ## Synthesized context
 
 {"kind":"context","sources":["M-id"],"content":"Useful facts"}
-Content may also be supported text/image blocks. Sources must be editable M IDs
-in the same current anchor interval. Sources may be removed or retained elsewhere
-in that interval. Treebase imports a display:true treebase.context custom message
-and records source provenance. Do not invent native historical tool calls or results.
+Replace related material with concise context supported by editable M sources
+between the same P/locked anchors. Those sources may be removed or retained
+elsewhere in that interval. Content may also be text/image blocks.
 
 ## Verbatim tool excerpts
 
 Replace a result's source line with:
 {"kind":"tool-excerpt","callSource":"assistant-id","resultSource":"result-id","keep":[{"block":0,"startLine":42,"endLine":57}]}
-Keep its full unchanged assistant call envelope as a separate source line. The
-excerpt does not insert the call itself. Every sibling tool call in a multi-call
-envelope still needs a result. The result must be editable M; the call may be M,
-P, or in the protected prefix.
+Keep the full unchanged assistant call as a separate source reference.
+Every sibling tool call still needs a matching result. The excerpted result must
+be editable M; its call may be M, P or in the read-only prefix.
 
-Ranges refer to original snapshot content blocks (zero-based) and text lines
-(1-based, inclusive, split on LF). They must be nonempty, sorted, disjoint and in
-bounds. Treebase extracts text directly and inserts explicit omission markers;
-do not supply replacement text. Non-text blocks are retained unchanged. Result
-metadata/error status and existing object details survive, with treebaseExcerpt
-provenance added. Non-object details cannot be excerpted. For paraphrases use
-synthesized context instead of pretending they are verbatim tool output.
+Ranges refer to original snapshot blocks (zero-based) and text lines (1-based,
+inclusive, split on LF). Ranges must be nonempty, sorted, disjoint and in bounds.
+Treebase extracts exact text, marks omissions and preserves non-text blocks and
+metadata. Results with non-object details cannot be excerpted.
+For paraphrases, use synthesized context instead.
 
-The native projected/converted effective context estimate must not grow and
-must fit 90% of the known model window. This is an estimate, not a provider token
-guarantee. Use programmatic inspection and batched edits; no fixed summary format.
+The effective context estimate must not grow and must fit 90% of the known model
+window. Use programmatic inspection and batched edits; no fixed summary format.
 
 ## Completion and recovery
 
 Write ${workspace.readyPath} only when editing is complete:
-{"operationId":"${workspace.manifest.operationId}","manifestHash":"${workspace.manifestHash}","ready":true}
-Readiness is validated at completed settlement; repair diagnostics may follow.
-After successful settlement treebase automatically revalidates and activates
-from an idle deferred command context. Editing activity never enters the final
-branch. /treebase resume continues an interrupted operation; /treebase cancel
-returns to original history. Reload requires a fresh resumed settled editing run.
-Supported native IDs/references are remapped by reconstruction; opaque
-extension-private references are not remapped automatically. Unsupported
-shapes, checkpoints and public append gaps fail explicitly.
-Artifacts remain for recovery. There is no protocol version or legacy reader;
-finish or cancel pending workspaces before updating the editing format.
+{"operationId":"${workspace.manifest.operationId}"}
+Then end your turn. Treebase validates and activates the result automatically;
+repair instructions may follow. Your context editing activity you perform during this process does not enter the final branch. Artifacts remain for recovery.
 `;
 }
 
